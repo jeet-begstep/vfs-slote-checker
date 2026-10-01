@@ -1,0 +1,273 @@
+const fileInput = document.getElementById('csvFile');
+const status = document.getElementById('status');
+const previewRoot = document.querySelector('.preview-body');
+const rowPicker = document.getElementById('rowPicker');
+const rowSelect = document.getElementById('rowSelect');
+const autofillBtn = document.getElementById('autofillBtn');
+const autofillStatus = document.getElementById('autofillStatus');
+
+let loadedRows = [];
+
+function setStatus(message, tone = 'info') {
+  status.textContent = message;
+  status.className = `status ${tone}`;
+}
+
+function setAutofillStatus(message, tone = '') {
+  autofillStatus.textContent = message;
+  autofillStatus.className = `autofill-status ${tone}`.trim();
+}
+
+fileInput.addEventListener('change', (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  console.log('[VFS Extension] Selected file:', file.name, file.size, 'bytes');
+  setStatus(`Reading ${file.name}...`, 'info');
+
+  const reader = new FileReader();
+  reader.onload = async (e) => {
+    try {
+      const rows = parseCSV(e.target.result);
+      console.log('[VFS Extension] Parsed CSV rows:', rows);
+      loadedRows = rows;
+
+      if (!rows.length) {
+        setStatus('CSV file is empty or invalid.', 'error');
+        previewRoot.innerHTML = '<div class="empty">No valid rows found.</div>';
+        rowPicker.classList.remove('visible');
+        return;
+      }
+
+      setStatus(`Loaded ${rows.length} row(s).`, 'success');
+      renderPreview(rows);
+      populateRowPicker(rows);
+
+      const rowToSend = rows[0] || {};
+      let sourceCountry = rowToSend.source || 'default';
+      let destinationCountry = rowToSend.destination || 'default';
+      let usernameValue = rowToSend.username || rowToSend.user || rowToSend.email || '';
+      let passwordValue = rowToSend.password || rowToSend.pass || '';
+
+      rows.forEach((row) => {
+        console.log('[VFS Extension] Row:', row);
+        if (row.source) sourceCountry = row.source;
+        if (row.destination) destinationCountry = row.destination;
+        if (row.username || row.user || row.email) {
+          usernameValue = row.username || row.user || row.email;
+        }
+        if (row.password || row.pass) {
+          passwordValue = row.password || row.pass;
+        }
+      });
+
+      const baseVfsUrl = `https://visa.vfsglobal.com/${sourceCountry || 'default'}/en/${destinationCountry || 'default'}`;
+      console.log('[VFS Extension] Redirecting active tab to base VFS URL:', baseVfsUrl);
+      await redirectToVfsLogin(sourceCountry, destinationCountry);
+      await sendRowToContentScript(rows[0], usernameValue, passwordValue);
+    } catch (err) {
+      setStatus(`Error parsing file: ${err.message}`, 'error');
+    }
+  };
+
+  reader.onerror = () => {
+    setStatus('Error reading file.', 'error');
+  };
+
+  reader.readAsText(file);
+});
+
+async function redirectToVfsLogin(sourceCountry, destinationCountry) {
+  console.log('[VFS Extension] Redirecting to VFS login page with source:', sourceCountry, 'and destination:', destinationCountry);
+  const baseVfsUrl = `https://visa.vfsglobal.com/${sourceCountry || 'default'}/en/${destinationCountry || 'default'}/login`;
+  console.log('[VFS Extension] Redirecting active tab to base VFS URL:', baseVfsUrl);
+
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tab && tab.id) {
+    chrome.tabs.update(tab.id, { url: baseVfsUrl });
+  } else {
+    console.error('[VFS Extension] No active tab found to redirect.');
+  }
+}
+
+async function sendRowToContentScript(row, usernameValue, passwordValue) {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.url || !tab.url.includes('visa.vfsglobal.com')) {
+    setAutofillStatus('Open the VFS Global login page first, then click Autofill.', 'error');
+    return;
+  }
+
+  chrome.tabs.sendMessage(tab.id, { type: 'AUTOFILL', row: row, usernameValue, passwordValue }, (response) => {
+    if (chrome.runtime.lastError) {
+      setAutofillStatus('Could not reach the page. Reload once after installing/updating the extension.', 'error');
+      return;
+    }
+    if (!response || !response.success) {
+      setAutofillStatus('Could not find matching fields on this page.', 'error');
+      return;
+    }
+    setAutofillStatus(`Filled ${response.filled} field(s). Review and log in manually.`, 'success');
+  });
+}
+
+function populateRowPicker(rows) {
+  if (rows.length === 0) {
+    rowPicker.classList.remove('visible');
+    return;
+  }
+
+  rowSelect.innerHTML = '';
+  rows.forEach((row, idx) => {
+    const label = rowLabel(row, idx);
+    const opt = document.createElement('option');
+    opt.value = String(idx);
+    opt.textContent = label;
+    rowSelect.appendChild(opt);
+  });
+
+  rowPicker.classList.add('visible');
+  setAutofillStatus('');
+}
+
+function rowLabel(row, idx) {
+  const keys = Object.keys(row);
+  const nonSecretKeys = keys.filter((k) => !/pass|secret|token|credential/i.test(k));
+  const parts = nonSecretKeys.slice(0, 3).map((k) => `${k}: ${row[k]}`);
+  return parts.length ? `Row ${idx + 1} — ${parts.join(', ')}` : `Row ${idx + 1}`;
+}
+
+autofillBtn.addEventListener('click', async () => {
+  const idx = Number(rowSelect.value);
+  const row = loadedRows[idx];
+  if (!row) {
+    setAutofillStatus('No row selected.', 'error');
+    return;
+  }
+
+  autofillBtn.disabled = true;
+  autofillBtn.textContent = 'Filling...';
+  setAutofillStatus('Filling selected row...');
+
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.url || !tab.url.includes('visa.vfsglobal.com')) {
+    autofillBtn.disabled = false;
+    autofillBtn.textContent = 'Autofill selected row';
+    setAutofillStatus('Open the VFS Global login page first, then click Autofill.', 'error');
+    return;
+  }
+
+  chrome.tabs.sendMessage(tab.id, { type: 'AUTOFILL', row }, (response) => {
+    autofillBtn.disabled = false;
+    autofillBtn.textContent = 'Autofill selected row';
+
+    if (chrome.runtime.lastError) {
+      setAutofillStatus('Could not reach the page. Reload once after installing/updating the extension.', 'error');
+      return;
+    }
+    if (!response || !response.success) {
+      setAutofillStatus('Could not find matching fields on this page.', 'error');
+      return;
+    }
+    setAutofillStatus(`Filled ${response.filled} field(s). Review and log in manually.`, 'success');
+  });
+});
+
+function parseCSV(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return [];
+
+  const headers = splitCSVLine(lines[0]).map((h) => h.trim());
+  const rows = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const values = splitCSVLine(lines[i]);
+    const row = {};
+    headers.forEach((header, idx) => {
+      row[header] = (values[idx] ?? '').trim();
+    });
+    rows.push(row);
+  }
+  return rows;
+}
+
+function splitCSVLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if (char === ',' && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  result.push(current);
+  return result;
+}
+
+function renderPreview(rows) {
+  if (rows.length === 0) {
+    previewRoot.innerHTML = '<div class="empty">No rows found.</div>';
+    return;
+  }
+
+  const headers = Object.keys(rows[0]);
+  let html = '<table><thead><tr>';
+  headers.forEach((h) => (html += `<th>${escapeHTML(h)}</th>`));
+  html += '</tr></thead><tbody>';
+
+  rows.slice(0, 10).forEach((row) => {
+    html += '<tr>';
+    headers.forEach((h) => {
+      const isSecret = /pass|secret|token|credential/i.test(h);
+      const val = isSecret ? '••••••' : row[h];
+      html += `<td>${escapeHTML(val)}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+
+  if (rows.length > 10) {
+    html += `<div class="empty">...and ${rows.length - 10} more row(s).</div>`;
+  }
+
+  previewRoot.innerHTML = html;
+}
+
+function escapeHTML(str) {
+  const div = document.createElement('div');
+  div.textContent = str ?? '';
+  return div.innerHTML;
+}
+
+// --- notification self-test -------------------------------------------------
+
+const testNotifyBtn = document.getElementById('testNotifyBtn');
+const testNotifyStatus = document.getElementById('testNotifyStatus');
+
+if (testNotifyBtn) {
+  testNotifyBtn.addEventListener('click', async () => {
+    testNotifyStatus.textContent = 'Sending...';
+    testNotifyStatus.className = 'autofill-status';
+
+    try {
+      const result = await chrome.runtime.sendMessage({ type: 'vfs-test-notify' });
+
+      if (result && result.ok) {
+        testNotifyStatus.textContent = 'Sent. If you see nothing, allow Chrome in macOS System Settings > Notifications.';
+        testNotifyStatus.className = 'autofill-status success';
+      } else {
+        testNotifyStatus.textContent = `Failed: ${result && result.error}`;
+        testNotifyStatus.className = 'autofill-status error';
+      }
+    } catch (error) {
+      testNotifyStatus.textContent = `Failed: ${error.message}`;
+      testNotifyStatus.className = 'autofill-status error';
+    }
+  });
+}

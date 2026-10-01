@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>VFS CSV Helper</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --panel: #ffffff;
+      --panel-strong: #edf3ff;
+      --line: #dfe7f4;
+      --text: #1d2a3a;
+      --muted: #5f6f86;
+      --brand: #f27d3a;
+      --brand-dark: #d96b2d;
+      --success: #1d8f5f;
+      --success-bg: #eafaf2;
+      --danger: #c94242;
+      --danger-bg: #feefef;
+      --shadow: 0 18px 40px rgba(22, 32, 52, 0.12);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 420px;
+      min-height: 420px;
+      background: linear-gradient(180deg, #edf3ff 0%, #f9fbff 100%);
+      color: var(--text);
+      font-family: "Segoe UI", Inter, sans-serif;
+    }
+
+    body {
+      padding: 16px;
+    }
+
+    .app {
+      background: var(--panel);
+      border: 1px solid rgba(160, 175, 199, 0.4);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .header {
+      background: linear-gradient(135deg, #1d2d42 0%, #203d5f 100%);
+      color: #fff;
+      padding: 18px 18px 14px;
+    }
+
+    .brand-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .brand-mark {
+      width: 28px;
+      height: 28px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.12);
+      border: 1px solid rgba(255,255,255,0.22);
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    .tag {
+      padding: 6px 10px;
+      background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.18);
+      border-radius: 999px;
+      font-size: 11px;
+      color: rgba(255,255,255,0.85);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .content {
+      padding: 18px;
+    }
+
+    .upload-wrap {
+      margin-bottom: 18px;
+    }
+
+    .file-label {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px dashed #b5c5df;
+      background: linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%);
+      color: var(--text);
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    .file-label:hover {
+      border-color: #89a9de;
+      background: #f2f7ff;
+    }
+
+    #csvFile {
+      position: absolute;
+      opacity: 0;
+      width: 1px;
+      height: 1px;
+      pointer-events: none;
+    }
+
+    .status {
+      min-height: 22px;
+      margin-top: 10px;
+      font-size: 12px;
+      line-height: 1.4;
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: #f5f8fc;
+      border: 1px solid var(--line);
+    }
+
+    .status.success {
+      color: var(--success);
+      background: var(--success-bg);
+      border-color: rgba(29, 143, 95, 0.18);
+    }
+
+    .status.error {
+      color: var(--danger);
+      background: var(--danger-bg);
+      border-color: rgba(201, 66, 66, 0.18);
+    }
+
+    .status.info {
+      color: var(--muted);
+      background: #f5f8fc;
+      border-color: var(--line);
+    }
+
+    .row-picker {
+      display: none;
+      margin-top: 18px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+    }
+
+    .row-picker.visible {
+      display: block;
+    }
+
+    .label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+
+    select, button {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      font: inherit;
+    }
+
+    select {
+      background: #fff;
+      padding: 11px 12px;
+      color: var(--text);
+      outline: none;
+    }
+
+    .primary-btn {
+      margin-top: 10px;
+      background: linear-gradient(135deg, var(--brand) 0%, var(--brand-dark) 100%);
+      color: #fff;
+      border: none;
+      padding: 12px 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.2s ease, filter 0.2s ease;
+      box-shadow: 0 10px 20px rgba(242, 125, 58, 0.25);
+    }
+
+    .primary-btn:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.02);
+    }
+
+    .primary-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .autofill-status {
+      min-height: 18px;
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
+    .autofill-status.success {
+      color: var(--success);
+    }
+
+    .autofill-status.error {
+      color: var(--danger);
+    }
+
+    .preview {
+      margin-top: 18px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #f9fbff;
+      overflow: hidden;
+    }
+
+    .preview-header {
+      padding: 10px 12px;
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      background: #eef4ff;
+      color: var(--muted);
+      border-bottom: 1px solid var(--line);
+      font-weight: 700;
+    }
+
+    .preview-body {
+      max-height: 180px;
+      overflow: auto;
+      background: white;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+
+    th, td {
+      border-bottom: 1px solid #edf2f8;
+      padding: 7px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f7f9ff;
+      color: var(--muted);
+      font-weight: 700;
+      position: sticky;
+      top: 0;
+    }
+
+    .empty {
+      padding: 16px 12px;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="header">
+      <div class="brand-row">
+        <div class="brand">
+          <div class="brand-mark">V</div>
+          <span>VFS CSV Helper</span>
+        </div>
+        <div class="tag">ready</div>
+      </div>
+    </div>
+
+    <div class="content">
+      <div class="upload-wrap">
+        <label class="file-label" for="csvFile">Choose CSV file</label>
+        <input type="file" id="csvFile" accept=".csv" />
+        <div id="status" class="status info">No file loaded yet.</div>
+      </div>
+
+      <div id="rowPicker" class="row-picker">
+        <label class="label" for="rowSelect">Row to use</label>
+        <select id="rowSelect"></select>
+        <button id="autofillBtn" class="primary-btn">Autofill selected row</button>
+        <div id="autofillStatus" class="autofill-status"></div>
+      </div>
+
+      <div class="alert-test">
+        <button id="testNotifyBtn" class="primary-btn">Test notification + sound</button>
+        <div id="testNotifyStatus" class="autofill-status"></div>
+      </div>
+
+      <div id="preview" class="preview">
+        <div class="preview-header">Preview</div>
+        <div class="preview-body">
+          <div class="empty">Upload a CSV file to preview data.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

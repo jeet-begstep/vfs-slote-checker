@@ -1,0 +1,56 @@
+{
+  "manifest_version": 3,
+  "name": "VFS Slot Checker",
+  "version": "1.6",
+  "description": "Checks VFS slot availability and alerts with a desktop notification and sound.",
+  "permissions": [
+    "scripting",
+    "activeTab",
+    "tabs",
+    "notifications",
+    "offscreen",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://visa.vfsglobal.com/*",
+    "https://lift-api.vfsglobal.com/*",
+    "https://www.vfsglobal.com/en/individuals/index.html",
+    "https://script.google.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://visa.vfsglobal.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["sounds/ding.wav"],
+      "matches": ["https://visa.vfsglobal.com/*"]
+    }
+  ]
+}

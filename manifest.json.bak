@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "VFS Slot Checker",
+  "version": "1.4",
+  "description": "Checks VFS slot availability dynamically every 3 minutes.",
+  "permissions": [
+    "scripting",
+    "activeTab",
+    "notifications",
+    "storage"
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "host_permissions": [
+    "https://visa.vfsglobal.com/*",
+    "https://lift-api.vfsglobal.com/*",
+    "https://www.vfsglobal.com/en/individuals/index.html"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://visa.vfsglobal.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+       "run_at": "document_idle"
+    }
+   
+  ]
+}
