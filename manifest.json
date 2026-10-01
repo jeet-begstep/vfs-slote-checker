@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "VFS Slot Checker",
-  "version": "1.6",
+  "version": "1.7",
   "description": "Checks VFS slot availability and alerts with a desktop notification and sound.",
   "permissions": [
     "scripting",

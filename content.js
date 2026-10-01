@@ -55,6 +55,219 @@
   }
 
   // -------------------------------------------------------
+  // 429 BACKOFF STATE & PERSISTENCE
+  // -------------------------------------------------------
+
+  const BACKOFF_STORAGE_KEY_ATTEMPT = 'VFS_429_ATTEMPT';
+  const BACKOFF_STORAGE_KEY_RETRY_TS = 'VFS_429_NEXT_RETRY_TS';
+  const BACKOFF_STORAGE_KEY_ACTIVE = 'VFS_429_IN_BACKOFF';
+
+  function getBackoffState() {
+    try {
+      const inBackoff = localStorage.getItem(BACKOFF_STORAGE_KEY_ACTIVE) === 'true';
+      const attempt = Number(localStorage.getItem(BACKOFF_STORAGE_KEY_ATTEMPT) || 0);
+      const nextRetryTs = Number(localStorage.getItem(BACKOFF_STORAGE_KEY_RETRY_TS) || 0);
+      const remainingMs = Math.max(0, nextRetryTs - Date.now());
+      return {
+        inBackoff,
+        attempt,
+        nextRetryTs,
+        remainingMs
+      };
+    } catch (e) {
+      return { inBackoff: false, attempt: 0, nextRetryTs: 0, remainingMs: 0 };
+    }
+  }
+
+  function setBackoffState(attempt, backoffMinutes) {
+    try {
+      const nextRetryTs = Date.now() + backoffMinutes * 60 * 1000;
+      localStorage.setItem(BACKOFF_STORAGE_KEY_ACTIVE, 'true');
+      localStorage.setItem(BACKOFF_STORAGE_KEY_ATTEMPT, String(attempt));
+      localStorage.setItem(BACKOFF_STORAGE_KEY_RETRY_TS, String(nextRetryTs));
+      console.log(
+        `[VFS Extension] 429 Backoff set: attempt ${attempt}, waiting ${backoffMinutes}m until ${new Date(nextRetryTs).toLocaleTimeString()}`
+      );
+    } catch (e) {
+      console.error('[VFS Extension] Failed to save backoff state:', e);
+    }
+  }
+
+  function clearBackoffState() {
+    try {
+      localStorage.removeItem(BACKOFF_STORAGE_KEY_ACTIVE);
+      localStorage.removeItem(BACKOFF_STORAGE_KEY_ATTEMPT);
+      localStorage.removeItem(BACKOFF_STORAGE_KEY_RETRY_TS);
+      console.log('[VFS Extension] 429 Backoff state cleared');
+    } catch (e) {}
+  }
+
+  // -------------------------------------------------------
+  // MY ACCOUNT DROPDOWN & LOGOUT AUTOMATION
+  // -------------------------------------------------------
+
+  function getMyAccountTrigger() {
+    const candidateSelectors = [
+      'button[aria-haspopup="menu"]',
+      'button.mat-mdc-menu-trigger',
+      'button.mat-menu-trigger',
+      'a.mat-mdc-menu-trigger',
+      'a.mat-menu-trigger',
+      '[aria-label*="account" i]',
+      '[aria-label*="profile" i]',
+      '[aria-label*="user" i]',
+      '.account-menu',
+      '.profile-menu',
+      '.user-menu',
+      'button',
+      'a',
+      'div[role="button"]'
+    ];
+
+    for (const selector of candidateSelectors) {
+      const elements = document.querySelectorAll(selector);
+      for (const el of elements) {
+        if (!isElementVisible(el)) continue;
+
+        const text = (el.textContent || el.value || '').trim().toLowerCase();
+        const aria = (el.getAttribute('aria-label') || '').trim().toLowerCase();
+        const id = (el.id || '').toLowerCase();
+        const className = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+
+        const matchesAccountText =
+          text.includes('my account') ||
+          text.includes('account') ||
+          text.includes('profile') ||
+          aria.includes('my account') ||
+          aria.includes('account') ||
+          aria.includes('profile') ||
+          id.includes('account') ||
+          className.includes('account') ||
+          text.includes('dinz51062@gmail.com');
+
+        if (matchesAccountText) {
+          return el;
+        }
+
+        // Also check if positioned in the top-right header area
+        const rect = el.getBoundingClientRect();
+        if (rect.top < 120 && rect.right > window.innerWidth * 0.5) {
+          if (
+            className.includes('menu-trigger') ||
+            el.hasAttribute('aria-haspopup') ||
+            aria.includes('user') ||
+            text.includes('@')
+          ) {
+            return el;
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function getLogoutMenuItem() {
+    const candidateContainers = [
+      '.mat-mdc-menu-panel',
+      '.mat-menu-panel',
+      '.cdk-overlay-container',
+      '[role="menu"]',
+      '.dropdown-menu',
+      'body'
+    ];
+
+    const itemSelectors = [
+      'button',
+      'a',
+      '[role="menuitem"]',
+      '.mat-mdc-menu-item',
+      '.mat-menu-item',
+      'span',
+      'div'
+    ];
+
+    for (const containerSel of candidateContainers) {
+      const container = document.querySelector(containerSel);
+      if (!container) continue;
+
+      for (const itemSel of itemSelectors) {
+        const items = container.querySelectorAll(itemSel);
+        for (const item of items) {
+          if (!isElementVisible(item)) continue;
+
+          const text = (item.textContent || item.value || '').trim().toLowerCase();
+          const aria = (item.getAttribute('aria-label') || '').trim().toLowerCase();
+
+          if (
+            text.includes('logout') ||
+            text.includes('log out') ||
+            text.includes('sign out') ||
+            text.includes('signout') ||
+            aria.includes('logout') ||
+            aria.includes('sign out')
+          ) {
+            return item;
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  async function triggerUiLogout(maxWaitMs = 8000) {
+    console.log('[VFS Extension] Initiating UI logout via My Account dropdown...');
+    showToast('⚠️ 429 Rate Limit hit. Logging out...', 'error');
+
+    const start = Date.now();
+    let menuOpened = false;
+
+    // 1. Try to find and click the "My Account" trigger
+    while (Date.now() - start < maxWaitMs) {
+      if (!menuOpened) {
+        const accountTrigger = getMyAccountTrigger();
+        if (accountTrigger) {
+          console.log('[VFS Extension] Found My Account trigger in top-right:', accountTrigger);
+          accountTrigger.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          accountTrigger.focus();
+          accountTrigger.click();
+          menuOpened = true;
+          await new Promise((r) => setTimeout(r, 600)); // wait for overlay animation
+        }
+      }
+
+      if (menuOpened) {
+        const logoutItem = getLogoutMenuItem();
+        if (logoutItem) {
+          console.log('[VFS Extension] Found Logout menu item in dropdown:', logoutItem);
+          logoutItem.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          logoutItem.focus();
+          logoutItem.click();
+          console.log('[VFS Extension] Clicked Logout button successfully.');
+          showToast('✅ Logged out successfully.', 'success');
+          return true;
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, 300));
+    }
+
+    console.warn('[VFS Extension] UI Logout elements not found, using fallback logout.');
+    // Fallback: Clear JWT tokens and redirect to login page
+    try {
+      sessionStorage.removeItem('JWT');
+      localStorage.removeItem('JWT');
+    } catch (e) {}
+
+    const { countryCode, missionCode } = getUrlParams();
+    const loginUrl = `https://visa.vfsglobal.com/${countryCode}/en/${missionCode}/login`;
+    console.log('[VFS Extension] Fallback redirecting to login:', loginUrl);
+    window.location.href = loginUrl;
+    return false;
+  }
+
+  // -------------------------------------------------------
   // TOKEN
   // -------------------------------------------------------
 
@@ -272,7 +485,7 @@
         countryCode: countryCode,
         missionCode: missionCode,
         vacCode: vacCode,
-        visaCategoryCode: 'StudenL',
+        visaCategoryCode: 'EmployeeL',
         roleName: 'Individual',
         loginUser: 'dinz51062@gmail.com',
         payCode: ''
@@ -307,11 +520,40 @@
         response.status
       );
 
+      if (response.status === 429) {
+        console.warn('[VFS Extension] 429 Too Many Requests detected');
+        const nextAttempt = (getBackoffState().attempt || 0) + 1;
+        const backoffMinutes = nextAttempt * 10;
+        setBackoffState(nextAttempt, backoffMinutes);
+
+        sendCheckLogEntry({
+          countryCode,
+          missionCode,
+          vacCode,
+          visaCategoryCode: payload.visaCategoryCode,
+          result: 'rate_limited',
+          errorMessage: 'HTTP 429 Too Many Requests',
+          httpStatus: 429
+        });
+
+        await sendPushAlert(
+          '⚠️ VFS 429 Rate Limited',
+          `Too many requests. Logging out and waiting ${backoffMinutes}m before re-login.`
+        );
+
+        stopChecker();
+        await triggerUiLogout();
+        return;
+      }
+
       if (!response.ok) {
         throw new Error(
           `HTTP ${response.status}`
         );
       }
+
+      // Successful 2xx response -> reset any previous 429 backoff state
+      clearBackoffState();
 
       const data = await response.json();
 
@@ -392,7 +634,7 @@
           countryCode: fallbackCountry,
           missionCode: fallbackMission,
           vacCode: `${fallbackMission}${fallbackCountry}`.toUpperCase(),
-          visaCategoryCode: 'StudenL',
+          visaCategoryCode: 'EmployeeL',
           result: 'error',
           errorMessage: error?.message,
           httpStatus: error?.message?.startsWith('HTTP ')
@@ -405,7 +647,12 @@
 
       checking = false;
 
-      scheduleNextCheck();
+      const backoff = getBackoffState();
+      if (!backoff.inBackoff) {
+        scheduleNextCheck();
+      } else {
+        console.log('[VFS Extension] In 429 backoff cooldown. Check scheduler paused.');
+      }
     }
   }
 
@@ -593,6 +840,92 @@
 
   let loginFormFilled = false;
   let loginSubmitAttempted = false;
+  let countdownTimerId = null;
+
+  function updateCooldownBanner(remainingMs, attempt) {
+    let banner = document.getElementById('vfs-cooldown-banner');
+    if (remainingMs <= 0) {
+      if (banner) banner.remove();
+      return;
+    }
+
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'vfs-cooldown-banner';
+      Object.assign(banner.style, {
+        position: 'fixed',
+        top: '20px',
+        left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: '9999999',
+        padding: '12px 24px',
+        borderRadius: '8px',
+        color: '#ffffff',
+        background: 'linear-gradient(135deg, #b91c1c, #dc2626)',
+        fontSize: '15px',
+        fontFamily: 'Arial, sans-serif',
+        fontWeight: 'bold',
+        textAlign: 'center',
+        boxShadow: '0 6px 20px rgba(0,0,0,0.35)',
+        border: '1px solid rgba(255,255,255,0.2)',
+        pointerEvents: 'none'
+      });
+      document.body.appendChild(banner);
+    }
+
+    const totalSec = Math.ceil(remainingMs / 1000);
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    const formatted = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+
+    banner.innerHTML = `⏳ Rate Limited (HTTP 429) &bull; Attempt #${attempt}<br><span style="font-size: 13px; font-weight: normal; opacity: 0.95;">Waiting cooldown before auto re-login: <strong>${formatted}</strong></span>`;
+  }
+
+  function removeCooldownBanner() {
+    const banner = document.getElementById('vfs-cooldown-banner');
+    if (banner) banner.remove();
+    if (countdownTimerId) {
+      clearInterval(countdownTimerId);
+      countdownTimerId = null;
+    }
+  }
+
+  function handleLoginCooldown(onCooldownComplete) {
+    const backoff = getBackoffState();
+    if (!backoff.inBackoff || backoff.remainingMs <= 0) {
+      removeCooldownBanner();
+      if (backoff.inBackoff && backoff.remainingMs <= 0) {
+        localStorage.removeItem(BACKOFF_STORAGE_KEY_ACTIVE);
+      }
+      return false;
+    }
+
+    console.log(
+      `[VFS Extension] Login paused for 429 cooldown. Remaining: ${Math.round(backoff.remainingMs / 1000)}s`
+    );
+
+    updateCooldownBanner(backoff.remainingMs, backoff.attempt);
+
+    if (countdownTimerId) {
+      clearInterval(countdownTimerId);
+    }
+
+    countdownTimerId = setInterval(() => {
+      const current = getBackoffState();
+      if (!current.inBackoff || current.remainingMs <= 0) {
+        removeCooldownBanner();
+        localStorage.removeItem(BACKOFF_STORAGE_KEY_ACTIVE);
+        console.log('[VFS Extension] 429 Cooldown complete. Proceeding with auto-login.');
+        if (typeof onCooldownComplete === 'function') {
+          onCooldownComplete();
+        }
+      } else {
+        updateCooldownBanner(current.remainingMs, current.attempt);
+      }
+    }, 1000);
+
+    return true;
+  }
 
   function isElementVisible(el) {
     if (!el) return false;
@@ -671,6 +1004,18 @@
   async function tryAutoFillLogin(force = false) {
     try {
       if (!isLoginPage()) return false;
+
+      const backoff = getBackoffState();
+      if (backoff.inBackoff && backoff.remainingMs > 0 && !force) {
+        console.log('[VFS Agent] In 429 backoff cooldown. Autofill delayed.');
+        handleLoginCooldown(() => {
+          loginFormFilled = false;
+          loginSubmitAttempted = false;
+          tryAutoFillLogin(true);
+        });
+        return false;
+      }
+
       if (loginFormFilled && !force) return false;
 
     // Selectors for email/username field in VFS Global login page
@@ -867,11 +1212,25 @@
   function initLoginWatcher() {
     if (!isLoginPage()) return;
     console.log("[VFS Agent] Initializing login page watcher for:", window.location.href);
+
+    const isCoolingDown = handleLoginCooldown(() => {
+      loginFormFilled = false;
+      loginSubmitAttempted = false;
+      tryAutoFillLogin(true);
+    });
+
+    if (isCoolingDown) {
+      console.log('[VFS Agent] Waiting for 429 cooldown before filling login form.');
+      return;
+    }
+
     // Attempt immediately
     tryAutoFillLogin();
 
     // Watch for dynamic DOM changes (Angular SPA rendering)
     const observer = new MutationObserver(() => {
+      const backoff = getBackoffState();
+      if (backoff.inBackoff && backoff.remainingMs > 0) return;
       if (!loginFormFilled && isLoginPage()) {
         tryAutoFillLogin();
       }
@@ -889,6 +1248,11 @@
     let attempts = 0;
     const interval = setInterval(() => {
       attempts++;
+      const backoff = getBackoffState();
+      if (backoff.inBackoff && backoff.remainingMs > 0) {
+        clearInterval(interval);
+        return;
+      }
       if (loginFormFilled || attempts > 30 || !isLoginPage()) {
         clearInterval(interval);
       } else {
