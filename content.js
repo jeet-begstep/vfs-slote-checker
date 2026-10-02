@@ -9,7 +9,7 @@
 
   window.__VFS_SLOT_CHECKER_RUNNING__ = true;
 
-  const CHECK_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+  const CHECK_INTERVAL_MS = 2.5 * 60 * 1000; // 2.5 minutes
   const API_URL =
     'https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable';
 
@@ -143,7 +143,7 @@
           aria.includes('profile') ||
           id.includes('account') ||
           className.includes('account') ||
-          text.includes('dinz51062@gmail.com');
+          /[\w.+-]+@[\w-]+\.[a-z]{2,}/i.test(text);
 
         if (matchesAccountText) {
           return el;
@@ -265,6 +265,33 @@
     console.log('[VFS Extension] Fallback redirecting to login:', loginUrl);
     window.location.href = loginUrl;
     return false;
+  }
+
+  // -------------------------------------------------------
+  // AUTOFILL CREDENTIALS (saved by the popup before redirecting to login)
+  // -------------------------------------------------------
+
+  const AUTOFILL_USERNAME_KEY = 'vfsAutofillUsername';
+  const AUTOFILL_PASSWORD_KEY = 'vfsAutofillPassword';
+
+  function getStoredAutofillCredentials() {
+    return new Promise((resolve) => {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+        resolve({ username: '', password: '' });
+        return;
+      }
+      chrome.storage.local.get([AUTOFILL_USERNAME_KEY, AUTOFILL_PASSWORD_KEY], (result) => {
+        resolve({
+          username: (result && result[AUTOFILL_USERNAME_KEY]) || '',
+          password: (result && result[AUTOFILL_PASSWORD_KEY]) || ''
+        });
+      });
+    });
+  }
+
+  function clearStoredAutofillCredentials() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+    chrome.storage.local.remove([AUTOFILL_USERNAME_KEY, AUTOFILL_PASSWORD_KEY]);
   }
 
   // -------------------------------------------------------
@@ -412,6 +439,7 @@
   // -------------------------------------------------------
 
   async function checkSlots() {
+        const creds = await getStoredAutofillCredentials();
 
     if (!isApplicationDetailPage()) {
       console.log(
@@ -485,9 +513,9 @@
         countryCode: countryCode,
         missionCode: missionCode,
         vacCode: vacCode,
-        visaCategoryCode: 'EmployeeL',
+        visaCategoryCode: 'EmployL',
         roleName: 'Individual',
-        loginUser: 'dinz51062@gmail.com',
+        loginUser: creds.username,
         payCode: ''
       };
 
@@ -634,7 +662,7 @@
           countryCode: fallbackCountry,
           missionCode: fallbackMission,
           vacCode: `${fallbackMission}${fallbackCountry}`.toUpperCase(),
-          visaCategoryCode: 'EmployeeL',
+          visaCategoryCode: 'EmployL',
           result: 'error',
           errorMessage: error?.message,
           httpStatus: error?.message?.startsWith('HTTP ')
@@ -1064,17 +1092,23 @@
         loginFormFilled = true;
         console.log("[VFS Agent] Detected login page at:", window.location.href);
 
-        // Move cursor to Email field and paste dummy email
-        await fillInputField(emailInput, "dinz51062@gmail.com");
-        console.log("[VFS Agent] Cursor moved to email field and filled: dinz51062@gmail.com");
+        const creds = await getStoredAutofillCredentials();
+
+        if (creds.username) {
+          await fillInputField(emailInput, creds.username);
+          console.log("[VFS Agent] Filled email field from stored autofill credentials");
+        }
 
         await new Promise((r) => setTimeout(r, 300));
 
-        // Move cursor to Password field and paste dummy password
-        await fillInputField(passwordInput, "Skillbee@1234");
-        console.log("[VFS Agent] Cursor moved to password field and filled: Skillbee@1234");
+        if (creds.password) {
+          await fillInputField(passwordInput, creds.password);
+          console.log("[VFS Agent] Filled password field from stored autofill credentials");
+        }
 
-        if (!loginSubmitAttempted) {
+        //clearStoredAutofillCredentials();
+
+        if (emailInput.value && passwordInput.value && !loginSubmitAttempted) {
           await clickSignInWhenEnabled();
         }
 

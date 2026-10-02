@@ -43,28 +43,18 @@ fileInput.addEventListener('change', (event) => {
       renderPreview(rows);
       populateRowPicker(rows);
 
-      const rowToSend = rows[0] || {};
-      let sourceCountry = rowToSend.source || 'default';
-      let destinationCountry = rowToSend.destination || 'default';
-      let usernameValue = rowToSend.username || rowToSend.user || rowToSend.email || '';
-      let passwordValue = rowToSend.password || rowToSend.pass || '';
+      rows.forEach((row) => console.log('[VFS Extension] Row:', row));
 
-      rows.forEach((row) => {
-        console.log('[VFS Extension] Row:', row);
-        if (row.source) sourceCountry = row.source;
-        if (row.destination) destinationCountry = row.destination;
-        if (row.username || row.user || row.email) {
-          usernameValue = row.username || row.user || row.email;
-        }
-        if (row.password || row.pass) {
-          passwordValue = row.password || row.pass;
-        }
-      });
+      const rowToSend = rows[0] || {};
+      const sourceCountry = rowToSend.source || 'default';
+      const destinationCountry = rowToSend.destination || 'default';
+      const usernameValue = rowToSend.email || rowToSend.user || rowToSend.username || '';
+      const passwordValue = rowToSend.password || rowToSend.pass || '';
 
       const baseVfsUrl = `https://visa.vfsglobal.com/${sourceCountry || 'default'}/en/${destinationCountry || 'default'}`;
       console.log('[VFS Extension] Redirecting active tab to base VFS URL:', baseVfsUrl);
+      saveAutofillCredentials(usernameValue, passwordValue);
       await redirectToVfsLogin(sourceCountry, destinationCountry);
-      await sendRowToContentScript(rows[0], usernameValue, passwordValue);
     } catch (err) {
       setStatus(`Error parsing file: ${err.message}`, 'error');
     }
@@ -77,6 +67,17 @@ fileInput.addEventListener('change', (event) => {
   reader.readAsText(file);
 });
 
+function saveAutofillCredentials(usernameValue, passwordValue) {
+  try {
+    chrome.storage.local.set({
+      vfsAutofillUsername: usernameValue || '',
+      vfsAutofillPassword: passwordValue || ''
+    });
+  } catch (e) {
+    console.error('[VFS Extension] Failed to save credentials to storage:', e);
+  }
+}
+
 async function redirectToVfsLogin(sourceCountry, destinationCountry) {
   console.log('[VFS Extension] Redirecting to VFS login page with source:', sourceCountry, 'and destination:', destinationCountry);
   const baseVfsUrl = `https://visa.vfsglobal.com/${sourceCountry || 'default'}/en/${destinationCountry || 'default'}/login`;
@@ -88,26 +89,6 @@ async function redirectToVfsLogin(sourceCountry, destinationCountry) {
   } else {
     console.error('[VFS Extension] No active tab found to redirect.');
   }
-}
-
-async function sendRowToContentScript(row, usernameValue, passwordValue) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.url || !tab.url.includes('visa.vfsglobal.com')) {
-    setAutofillStatus('Open the VFS Global login page first, then click Autofill.', 'error');
-    return;
-  }
-
-  chrome.tabs.sendMessage(tab.id, { type: 'AUTOFILL', row: row, usernameValue, passwordValue }, (response) => {
-    if (chrome.runtime.lastError) {
-      setAutofillStatus('Could not reach the page. Reload once after installing/updating the extension.', 'error');
-      return;
-    }
-    if (!response || !response.success) {
-      setAutofillStatus('Could not find matching fields on this page.', 'error');
-      return;
-    }
-    setAutofillStatus(`Filled ${response.filled} field(s). Review and log in manually.`, 'success');
-  });
 }
 
 function populateRowPicker(rows) {
@@ -156,7 +137,11 @@ autofillBtn.addEventListener('click', async () => {
     return;
   }
 
-  chrome.tabs.sendMessage(tab.id, { type: 'AUTOFILL', row }, (response) => {
+  const usernameValue = row.email || row.user || row.username || '';
+  const passwordValue = row.password || row.pass || '';
+  saveAutofillCredentials(usernameValue, passwordValue);
+
+  chrome.tabs.sendMessage(tab.id, { type: 'AUTOFILL', row, usernameValue, passwordValue }, (response) => {
     autofillBtn.disabled = false;
     autofillBtn.textContent = 'Autofill selected row';
 
