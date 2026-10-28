@@ -61,32 +61,66 @@
   const BACKOFF_STORAGE_KEY_ATTEMPT = 'VFS_429_ATTEMPT';
   const BACKOFF_STORAGE_KEY_RETRY_TS = 'VFS_429_NEXT_RETRY_TS';
   const BACKOFF_STORAGE_KEY_ACTIVE = 'VFS_429_IN_BACKOFF';
+  const BACKOFF_STORAGE_KEY_REASON = 'VFS_429_REASON';
+
+  // -------------------------------------------------------
+  // SESSION AGE TRACKING (force re-login every 29 minutes)
+  // -------------------------------------------------------
+
+  const LOGIN_TIME_STORAGE_KEY = 'VFS_LAST_LOGIN_TS';
+  const SESSION_MAX_AGE_MS = 29 * 60 * 1000; // 29 minutes
+  const SESSION_TIMEOUT_COOLDOWN_MIN = 10; // minutes
+
+  function recordLoginTime() {
+    try {
+      localStorage.setItem(LOGIN_TIME_STORAGE_KEY, String(Date.now()));
+      console.log('[VFS Extension] Login time recorded:', new Date().toLocaleString());
+    } catch (e) {}
+  }
+
+  function getLoginTime() {
+    try {
+      const ts = Number(localStorage.getItem(LOGIN_TIME_STORAGE_KEY) || 0);
+      return ts || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function getSessionAgeMs() {
+    const loginTs = getLoginTime();
+    if (!loginTs) return 0;
+    return Date.now() - loginTs;
+  }
 
   function getBackoffState() {
     try {
       const inBackoff = localStorage.getItem(BACKOFF_STORAGE_KEY_ACTIVE) === 'true';
       const attempt = Number(localStorage.getItem(BACKOFF_STORAGE_KEY_ATTEMPT) || 0);
       const nextRetryTs = Number(localStorage.getItem(BACKOFF_STORAGE_KEY_RETRY_TS) || 0);
+      const reason = localStorage.getItem(BACKOFF_STORAGE_KEY_REASON) || 'rate_limit';
       const remainingMs = Math.max(0, nextRetryTs - Date.now());
       return {
         inBackoff,
         attempt,
         nextRetryTs,
-        remainingMs
+        remainingMs,
+        reason
       };
     } catch (e) {
-      return { inBackoff: false, attempt: 0, nextRetryTs: 0, remainingMs: 0 };
+      return { inBackoff: false, attempt: 0, nextRetryTs: 0, remainingMs: 0, reason: 'rate_limit' };
     }
   }
 
-  function setBackoffState(attempt, backoffMinutes) {
+  function setBackoffState(attempt, backoffMinutes, reason = 'rate_limit') {
     try {
       const nextRetryTs = Date.now() + backoffMinutes * 60 * 1000;
       localStorage.setItem(BACKOFF_STORAGE_KEY_ACTIVE, 'true');
       localStorage.setItem(BACKOFF_STORAGE_KEY_ATTEMPT, String(attempt));
       localStorage.setItem(BACKOFF_STORAGE_KEY_RETRY_TS, String(nextRetryTs));
+      localStorage.setItem(BACKOFF_STORAGE_KEY_REASON, reason);
       console.log(
-        `[VFS Extension] 429 Backoff set: attempt ${attempt}, waiting ${backoffMinutes}m until ${new Date(nextRetryTs).toLocaleTimeString()}`
+        `[VFS Extension] Backoff set (${reason}): attempt ${attempt}, waiting ${backoffMinutes}m until ${new Date(nextRetryTs).toLocaleTimeString()}`
       );
     } catch (e) {
       console.error('[VFS Extension] Failed to save backoff state:', e);
@@ -98,6 +132,7 @@
       localStorage.removeItem(BACKOFF_STORAGE_KEY_ACTIVE);
       localStorage.removeItem(BACKOFF_STORAGE_KEY_ATTEMPT);
       localStorage.removeItem(BACKOFF_STORAGE_KEY_RETRY_TS);
+      localStorage.removeItem(BACKOFF_STORAGE_KEY_REASON);
       console.log('[VFS Extension] 429 Backoff state cleared');
     } catch (e) {}
   }
@@ -509,6 +544,34 @@
         vacCode
       );
 
+      const sessionAgeMs = getSessionAgeMs();
+
+      if (sessionAgeMs >= SESSION_MAX_AGE_MS) {
+        console.warn(
+          `[VFS Extension] Session age ${Math.round(sessionAgeMs / 60000)}m >= 29m limit. Forcing re-login.`
+        );
+
+        setBackoffState(1, SESSION_TIMEOUT_COOLDOWN_MIN, 'session_timeout');
+
+        sendCheckLogEntry({
+          countryCode,
+          missionCode,
+          vacCode,
+          visaCategoryCode: 'EmployL',
+          result: 'session_timeout',
+          errorMessage: 'Session exceeded 29 minute limit'
+        });
+
+        await sendPushAlert(
+          '🔄 VFS Session Refresh',
+          `Session active for 29+ minutes. Logging out and waiting ${SESSION_TIMEOUT_COOLDOWN_MIN}m before re-login.`
+        );
+
+        stopChecker();
+        await triggerUiLogout();
+        return;
+      }
+
       const payload = {
         countryCode: countryCode,
         missionCode: missionCode,
@@ -552,7 +615,7 @@
         console.warn('[VFS Extension] 429 Too Many Requests detected');
         const nextAttempt = (getBackoffState().attempt || 0) + 1;
         const backoffMinutes = nextAttempt * 10;
-        setBackoffState(nextAttempt, backoffMinutes);
+        setBackoffState(nextAttempt, backoffMinutes, 'rate_limit');
 
         sendCheckLogEntry({
           countryCode,
@@ -870,7 +933,7 @@
   let loginSubmitAttempted = false;
   let countdownTimerId = null;
 
-  function updateCooldownBanner(remainingMs, attempt) {
+  function updateCooldownBanner(remainingMs, attempt, reason) {
     let banner = document.getElementById('vfs-cooldown-banner');
     if (remainingMs <= 0) {
       if (banner) banner.remove();
@@ -906,7 +969,12 @@
     const secs = totalSec % 60;
     const formatted = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 
-    banner.innerHTML = `⏳ Rate Limited (HTTP 429) &bull; Attempt #${attempt}<br><span style="font-size: 13px; font-weight: normal; opacity: 0.95;">Waiting cooldown before auto re-login: <strong>${formatted}</strong></span>`;
+    const headline =
+      reason === 'session_timeout'
+        ? '🔄 Session Timeout (29m limit)'
+        : '⏳ Rate Limited (HTTP 429)';
+
+    banner.innerHTML = `${headline} &bull; Attempt #${attempt}<br><span style="font-size: 13px; font-weight: normal; opacity: 0.95;">Waiting cooldown before auto re-login: <strong>${formatted}</strong></span>`;
   }
 
   function removeCooldownBanner() {
@@ -932,7 +1000,7 @@
       `[VFS Extension] Login paused for 429 cooldown. Remaining: ${Math.round(backoff.remainingMs / 1000)}s`
     );
 
-    updateCooldownBanner(backoff.remainingMs, backoff.attempt);
+    updateCooldownBanner(backoff.remainingMs, backoff.attempt, backoff.reason);
 
     if (countdownTimerId) {
       clearInterval(countdownTimerId);
@@ -948,7 +1016,7 @@
           onCooldownComplete();
         }
       } else {
-        updateCooldownBanner(current.remainingMs, current.attempt);
+        updateCooldownBanner(current.remainingMs, current.attempt, current.reason);
       }
     }, 1000);
 
@@ -1226,6 +1294,7 @@
   function initDashboardWatcher() {
     if (!isDashboardPage()) return;
     console.log('[VFS Agent] Initializing dashboard watcher for:', window.location.href);
+    recordLoginTime();
     clickStartNewBookingWhenAvailable();
 
     const observer = new MutationObserver(() => {
