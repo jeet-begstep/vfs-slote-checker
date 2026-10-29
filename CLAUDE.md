@@ -29,11 +29,24 @@ There is no build system, package manager, or test suite — this is plain unbun
   - Background has no Audio API either, so it creates an `offscreen.html` document (`chrome.offscreen.createDocument`, reason `AUDIO_PLAYBACK`) and messages *that* to actually play `sounds/ding.wav`.
   - So a single alert fans out: content script → background (notification) → offscreen doc (sound). If notifications/sound ever silently stop working, check which hop broke, not just `content.js`.
 - `popup.js` / `popup.html` — the toolbar popup. Parses a user-supplied CSV client-side, then messages the *active tab's* content script (`type: 'AUTOFILL'`) to fill username/password fields and redirect to the right country/mission login URL.
+- `page-hook.js` — a second content script running in the page's **MAIN world** at `document_start` (needs Chrome 111+). It wraps `fetch` and `XMLHttpRequest.setRequestHeader` only to copy the `ClientSource` header of the page's own `lift-api.vfsglobal.com` requests into `sessionStorage['VFS_CLIENT_SOURCE']` (+ `_TS`). `sessionStorage` is shared between the MAIN and isolated worlds, which is how `content.js` reads it. If VFS's anti-bot scripts ever object to the patched `fetch`, remove its `manifest.json` entry; `content.js` falls back to a hardcoded value.
+- `slot-targets.js` — pure CSV-cell parser shared by the popup (`<script>` tag) and `tests/` (`module.exports` guard). Tests: `node --test "tests/*.test.js"` (a bare directory arg fails on Node 22).
+
+### CSV format
+```
+email,password,source,destination,vacCode|visaCategoryCode
+someone@example.com,<pw>,are,lva,"AUH|LL,DXB|LL"
+```
+The last column is one or more `vacCode|visaCategoryCode` pairs (comma-separated, so the cell must be quoted). `vacCode` is the Visa Application Center. A legacy single value (`EmployL`, old header `visaCategoryCode`) still works: it becomes `{vacCode: null}` and `content.js` derives `${mission}${country}` as before. The popup always overwrites `chrome.storage.local['vfsSlotTargets']` on upload/Autofill, `[]` when the column is missing.
 
 ### Slot-checker loop (in `content.js`)
 - Only runs on `/application-detail` pages (`isApplicationDetailPage()`); a MutationObserver-free polling approach instead uses hooked `history.pushState`/`replaceState`/`popstate` plus a 5s backup `setInterval` (`detectUrlChange`) to detect SPA navigation, since VFS is a client-routed Nuxt/Vue app that doesn't do full page loads.
 - `checkSlots()` reads a JWT from `sessionStorage`/`localStorage` (`getAuthToken()`), POSTs to the hardcoded `lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable`, and either alerts (slot found) or logs (no slot / error) — always via the `finally` block calling `scheduleNextCheck()`, so the loop is self-perpetuating regardless of success/failure. A stuck `checking` flag is the only thing that would silently kill it.
-- The request payload (`visaCategoryCode`, `loginUser`, `payCode`, the `ClientSource` header) is **hardcoded for one specific account/category**, not read from any config or the CSV. Repurposing this for a different VFS account, country, or visa category means editing these literals directly in `checkSlots()`.
+- Each cycle checks every target in `vfsSlotTargets` one after another (`checkOneTarget()`), `STAGGER_MS` (8s ± 2s jitter) apart; the 2.5-minute timer starts after the whole cycle ends, so cycles never overlap. Empty storage → one legacy target (`${mission}${country}` + `EmployL`).
+  - A 429 on any target skips the remaining targets, still alerts on any slot found earlier in the cycle, then runs the backoff/logout path below. `clearBackoffState()` runs once at the end of a cycle that had a 2xx and no 429 (not per target), so the attempt counter still escalates. Other errors are logged for that target and the loop moves on.
+  - Before each target after the first, the loop re-checks the page and JWT and stops if either is gone.
+  - Alerts are combined: one slot alert (toast + push + blocking `alert()`, after all targets are checked), one "no slot" push, one error push per cycle.
+- `countryCode`/`missionCode`/`Route` come from the URL; `loginUser` from stored credentials. `ClientSource` comes from `getClientSource()`: the value captured by `page-hook.js` if it was captured no earlier than 2 minutes before `VFS_LAST_LOGIN_TS` (older means a previous session), else `FALLBACK_CLIENT_SOURCE`. Each Sheet log entry records `clientSourceOrigin` (`captured`/`fallback`), so 401/403s can be tied to the source.
 
 ### Forced re-login / backoff (in `content.js`)
 - Two independent triggers force a logout-and-cooldown cycle from inside `checkSlots()`, and both drive the *same* mechanism: `stopChecker()` → `triggerUiLogout()` (clicks the My Account → Logout menu, falling back to clearing the JWT and redirecting to `/login`) → `setBackoffState(attempt, minutes, reason)`.
@@ -52,3 +65,5 @@ There is no build system, package manager, or test suite — this is plain unbun
 - Content script → background: `{type: 'vfs-notify', title, message}` → `{ok, id}` or `{ok: false, error}`.
 - Popup → background (self-test): `{type: 'vfs-test-notify'}`.
 - Background → offscreen doc: `{target: 'offscreen', type: 'play-sound', source, volume}`.
+- Popup → content script via `chrome.storage.local`: `vfsAutofillUsername`, `vfsAutofillPassword`, `vfsSlotTargets: [{vacCode: string|null, visaCategoryCode}]`.
+- Content script → background: `{type: 'vfs-log', entry}`, where `entry` includes `vacCode`, `visaCategoryCode`, `clientSourceOrigin`, `result`. Logged once per target per cycle.

@@ -45,7 +45,8 @@ function doPost(e) {
       entry.result || '',
       entry.earliestDate || '',
       entry.errorMessage || '',
-      entry.httpStatus || ''
+      entry.httpStatus || '',
+      entry.clientSourceOrigin || ''
     ]);
 
     sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
@@ -71,7 +72,8 @@ function getOrCreateSheet() {
       'result',
       'earliestDate',
       'errorMessage',
-      'httpStatus'
+      'httpStatus',
+      'clientSourceOrigin' // added later: on an existing tab, type this header into column J by hand
     ]);
   }
 

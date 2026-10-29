@@ -10,8 +10,16 @@
   window.__VFS_SLOT_CHECKER_RUNNING__ = true;
 
   const CHECK_INTERVAL_MS = 2.5 * 60 * 1000; // 2.5 minutes
+  const STAGGER_MS = 30000; // gap between centers within one cycle
+  const STAGGER_JITTER_MS = 2000;
+  const LEGACY_VISA_CATEGORY_CODE = 'EmployL';
   const API_URL =
     'https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable';
+
+  // Used only when page-hook.js hasn't captured the page's own ClientSource
+  // since the last login.
+  const FALLBACK_CLIENT_SOURCE =
+    'imMG/l4MmYDsEvVPyHan3Tsc8dbxyD66qU4ZBAHKdDpkczriHRLjkHzXgYB97EXeat02vIldwprT+J+KOiXkH6btSCRq92U2f91aTt/B5XSq2XBUxYbA5OuL8CG3bnyxGChchENtdnUGvQz8eF4mZJjBy84dgS78ETWrQZnCFY+TLVbCzZ635iwf2JGwZjE5gC2p6ejNFdTrRQZmfmVbms7mH5Z4cALUUuFS3XjYxzYJmFmz/i+3Bg+V8Jg0o7OGs0xcfpbQs/Cij2PtjSqrgE0JJxiEmNLJFwZvDYplnZSK0PcttKJMJX9NkCwyIcXHePVVcfMzF26y5bJTtyGtlQ==';
 
   let timer = null;
   let checking = false;
@@ -329,6 +337,46 @@
     chrome.storage.local.remove([AUTOFILL_USERNAME_KEY, AUTOFILL_PASSWORD_KEY]);
   }
 
+  // [{vacCode, visaCategoryCode}] parsed from the CSV by the popup (slot-targets.js).
+  const SLOT_TARGETS_KEY = 'vfsSlotTargets';
+
+  function getStoredSlotTargets() {
+    return new Promise((resolve) => {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+        resolve([]);
+        return;
+      }
+      chrome.storage.local.get([SLOT_TARGETS_KEY], (result) => {
+        const targets = result && result[SLOT_TARGETS_KEY];
+        resolve(Array.isArray(targets) ? targets.filter((t) => t && t.visaCategoryCode) : []);
+      });
+    });
+  }
+
+  // -------------------------------------------------------
+  // CLIENT SOURCE (captured from the page by page-hook.js)
+  // -------------------------------------------------------
+
+  const CLIENT_SOURCE_STORAGE_KEY = 'VFS_CLIENT_SOURCE';
+  const CLIENT_SOURCE_TS_STORAGE_KEY = 'VFS_CLIENT_SOURCE_TS';
+  // The page sends lift-api requests during login, slightly before the dashboard
+  // watcher stamps VFS_LAST_LOGIN_TS. Anything older is from a previous session.
+  const CLIENT_SOURCE_LOGIN_TOLERANCE_MS = 2 * 60 * 1000;
+
+  function getClientSource() {
+    try {
+      const value = sessionStorage.getItem(CLIENT_SOURCE_STORAGE_KEY);
+      const capturedTs = Number(sessionStorage.getItem(CLIENT_SOURCE_TS_STORAGE_KEY) || 0);
+      const loginTs = getLoginTime() || 0;
+
+      if (value && capturedTs >= loginTs - CLIENT_SOURCE_LOGIN_TOLERANCE_MS) {
+        return { value, origin: 'captured' };
+      }
+    } catch (e) {}
+
+    return { value: FALLBACK_CLIENT_SOURCE, origin: 'fallback' };
+  }
+
   // -------------------------------------------------------
   // TOKEN
   // -------------------------------------------------------
@@ -449,6 +497,7 @@
     missionCode,
     vacCode,
     visaCategoryCode,
+    clientSourceOrigin = null,
     result,
     earliestDate = null,
     errorMessage = null,
@@ -460,6 +509,7 @@
       missionCode,
       vacCode,
       visaCategoryCode,
+      clientSourceOrigin,
       result,
       earliestDate,
       errorMessage,
@@ -473,8 +523,159 @@
   // CHECK SLOT
   // -------------------------------------------------------
 
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Resolves stored targets to concrete {vacCode, visaCategoryCode} pairs.
+  // vacCode null (legacy "EmployL" CSV) or no stored targets -> derived vacCode,
+  // which preserves the pre-multi-center behaviour.
+  async function getSlotTargets(legacyVacCode) {
+    const stored = await getStoredSlotTargets();
+
+    if (!stored.length) {
+      return [{ vacCode: legacyVacCode, visaCategoryCode: LEGACY_VISA_CATEGORY_CODE }];
+    }
+
+    return stored.map((target) => ({
+      vacCode: target.vacCode || legacyVacCode,
+      visaCategoryCode: target.visaCategoryCode
+    }));
+  }
+
+  // One API call for one center/category. Never throws.
+  async function checkOneTarget(target, ctx) {
+    const logBase = {
+      countryCode: ctx.countryCode,
+      missionCode: ctx.missionCode,
+      vacCode: target.vacCode,
+      visaCategoryCode: target.visaCategoryCode,
+      clientSourceOrigin: ctx.clientSource.origin
+    };
+
+    try {
+      const token = getAuthToken();
+
+      if (!token) {
+        throw new Error('No JWT');
+      }
+
+      const payload = {
+        countryCode: ctx.countryCode,
+        missionCode: ctx.missionCode,
+        vacCode: target.vacCode,
+        visaCategoryCode: target.visaCategoryCode,
+        roleName: 'Individual',
+        loginUser: ctx.loginUser,
+        payCode: ''
+      };
+
+      const response = await fetch(API_URL, {
+        method: 'POST',
+
+        headers: {
+          'Accept':
+            'application/json, text/plain, */*',
+
+          'Accept-Language':
+            'en-GB,en-US;q=0.9,en;q=0.8',
+
+          'Authorize': token,
+
+          'ClientSource': ctx.clientSource.value,
+
+          'Content-Type':
+            'application/json;charset=UTF-8',
+
+          'Route': ctx.routeHeader
+        },
+
+        body: JSON.stringify(payload)
+      });
+
+      console.log(
+        `[VFS Extension] API status (${target.vacCode}/${target.visaCategoryCode}):`,
+        response.status
+      );
+
+      if (response.status === 429) {
+        console.warn('[VFS Extension] 429 Too Many Requests detected');
+
+        sendCheckLogEntry({
+          ...logBase,
+          result: 'rate_limited',
+          errorMessage: 'HTTP 429 Too Many Requests',
+          httpStatus: 429
+        });
+
+        return { status: 'rate_limited' };
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          `HTTP ${response.status}`
+        );
+      }
+
+      // 2xx: backoff is cleared once per cycle in checkSlots(), not here, so a
+      // 429 on a later center still escalates from the previous attempt count.
+      const data = await response.json();
+
+      console.log(
+        '[VFS Extension] API response:',
+        data
+      );
+
+      if (data && data.earliestDate) {
+        console.log(
+          '[VFS Extension] 🚨 SLOT AVAILABLE:',
+          target.vacCode,
+          data.earliestDate
+        );
+
+        sendCheckLogEntry({
+          ...logBase,
+          result: 'slot_available',
+          earliestDate: data.earliestDate,
+          httpStatus: response.status
+        });
+
+        return { status: 'slot', earliestDate: data.earliestDate };
+      }
+
+      console.log(
+        `[VFS Extension] No slot available at ${target.vacCode}/${target.visaCategoryCode}`
+      );
+
+      sendCheckLogEntry({
+        ...logBase,
+        result: 'no_slot',
+        httpStatus: response.status
+      });
+
+      return { status: 'none' };
+
+    } catch (error) {
+
+      console.log(
+        `[VFS Extension] API error (${target.vacCode}/${target.visaCategoryCode}):`,
+        error
+      );
+
+      sendCheckLogEntry({
+        ...logBase,
+        result: 'error',
+        errorMessage: error?.message,
+        httpStatus: error?.message?.startsWith('HTTP ')
+          ? Number(error.message.slice(5))
+          : null
+      });
+
+      return { status: 'error', errorMessage: error?.message };
+    }
+  }
+
   async function checkSlots() {
-        const creds = await getStoredAutofillCredentials();
 
     if (!isApplicationDetailPage()) {
       console.log(
@@ -507,10 +708,7 @@
 
     try {
 
-      // Get latest JWT every time
-      const token = getAuthToken();
-
-      if (!token) {
+      if (!getAuthToken()) {
         console.log(
           '[VFS Extension] No JWT. Will retry later.'
         );
@@ -518,30 +716,37 @@
         return;
       }
 
+      const creds = await getStoredAutofillCredentials();
+
       const {
         countryCode,
         missionCode
       } = getUrlParams();
 
-      const vacCode =
+      const legacyVacCode =
         `${missionCode}${countryCode}`.toUpperCase();
 
       const routeHeader =
         `${countryCode}/en/${missionCode}`;
 
-      console.log(
-        '[VFS Extension] Country:',
-        countryCode
-      );
+      const clientSource = getClientSource();
+
+      const targets = await getSlotTargets(legacyVacCode);
 
       console.log(
-        '[VFS Extension] Mission:',
+        '[VFS Extension] Country:',
+        countryCode,
+        'Mission:',
         missionCode
       );
 
       console.log(
-        '[VFS Extension] VAC:',
-        vacCode
+        '[VFS Extension] Targets:',
+        targets.map((t) => `${t.vacCode}/${t.visaCategoryCode}`).join(', ')
+      );
+
+      console.log(
+        `[VFS Extension] ClientSource: ${clientSource.origin} (${clientSource.value.slice(0, 12)}...)`
       );
 
       const sessionAgeMs = getSessionAgeMs();
@@ -556,8 +761,9 @@
         sendCheckLogEntry({
           countryCode,
           missionCode,
-          vacCode,
-          visaCategoryCode: 'EmployL',
+          vacCode: targets.map((t) => t.vacCode).join(','),
+          visaCategoryCode: targets.map((t) => t.visaCategoryCode).join(','),
+          clientSourceOrigin: clientSource.origin,
           result: 'session_timeout',
           errorMessage: 'Session exceeded 29 minute limit'
         });
@@ -572,60 +778,82 @@
         return;
       }
 
-      const payload = {
-        countryCode: countryCode,
-        missionCode: missionCode,
-        vacCode: vacCode,
-        visaCategoryCode: 'EmployL',
-        roleName: 'Individual',
+      const ctx = {
+        countryCode,
+        missionCode,
+        routeHeader,
         loginUser: creds.username,
-        payCode: ''
+        clientSource
       };
 
-      const response = await fetch(API_URL, {
-        method: 'POST',
+      const found = [];
+      const errors = [];
+      let noSlotCount = 0;
+      let rateLimited = false;
 
-        headers: {
-          'Accept':
-            'application/json, text/plain, */*',
+      for (let i = 0; i < targets.length; i++) {
+        const target = targets[i];
 
-          'Accept-Language':
-            'en-GB,en-US;q=0.9,en;q=0.8',
+        if (i > 0) {
+          const jitter = Math.round((Math.random() * 2 - 1) * STAGGER_JITTER_MS);
+          await sleep(STAGGER_MS + jitter);
 
-          'Authorize': token,
+          // User may have navigated away or been logged out during the gap.
+          if (!isApplicationDetailPage() || !getAuthToken()) {
+            console.log(
+              '[VFS Extension] Page or session changed mid-cycle. Skipping remaining targets.'
+            );
+            break;
+          }
+        }
 
-          'ClientSource':
-            'imMG/l4MmYDsEvVPyHan3Tsc8dbxyD66qU4ZBAHKdDpkczriHRLjkHzXgYB97EXeat02vIldwprT+J+KOiXkH6btSCRq92U2f91aTt/B5XSq2XBUxYbA5OuL8CG3bnyxGChchENtdnUGvQz8eF4mZJjBy84dgS78ETWrQZnCFY+TLVbCzZ635iwf2JGwZjE5gC2p6ejNFdTrRQZmfmVbms7mH5Z4cALUUuFS3XjYxzYJmFmz/i+3Bg+V8Jg0o7OGs0xcfpbQs/Cij2PtjSqrgE0JJxiEmNLJFwZvDYplnZSK0PcttKJMJX9NkCwyIcXHePVVcfMzF26y5bJTtyGtlQ==',
+        console.log(
+          `[VFS Extension] Checking ${target.vacCode}/${target.visaCategoryCode} (${i + 1}/${targets.length})`
+        );
 
-          'Content-Type':
-            'application/json;charset=UTF-8',
+        const result = await checkOneTarget(target, ctx);
 
-          'Route': routeHeader
-        },
+        if (result.status === 'rate_limited') {
+          // Skip the remaining targets, but still alert on any slot found
+          // earlier in this cycle before logging out (handled below).
+          rateLimited = true;
+          break;
+        }
 
-        body: JSON.stringify(payload)
-      });
+        if (result.status === 'slot') {
+          found.push(`${target.vacCode}/${target.visaCategoryCode}: ${result.earliestDate}`);
+        } else if (result.status === 'none') {
+          noSlotCount += 1;
+        } else {
+          errors.push(`${target.vacCode}/${target.visaCategoryCode}: ${result.errorMessage}`);
+        }
+      }
 
-      console.log(
-        '[VFS Extension] API status:',
-        response.status
-      );
+      // One combined alert per cycle. alert() blocks, so it runs only after
+      // every target has been checked.
+      if (found.length) {
+        const summary = found.join('\n');
+        showToast(`🚨 VFS SLOT AVAILABLE\n${summary}`);
+        await sendPushAlert(
+          '🚨 VFS SLOT AVAILABLE',
+          summary
+        );
+        alert(`🚨 VFS SLOT AVAILABLE\n${summary}`);
+        // Important:
+        // Do NOT stop checking.
+        // It will continue on the next cycle.
+      } else if (noSlotCount && !rateLimited) {
+        showToast(`No slot available (checked ${noSlotCount} center(s))`, 'error');
+        await sendPushAlert(
+          'No slot available',
+          `Appointment check completed for ${noSlotCount} center(s).`
+        );
+      }
 
-      if (response.status === 429) {
-        console.warn('[VFS Extension] 429 Too Many Requests detected');
+      if (rateLimited) {
         const nextAttempt = (getBackoffState().attempt || 0) + 1;
         const backoffMinutes = nextAttempt * 10;
         setBackoffState(nextAttempt, backoffMinutes, 'rate_limit');
-
-        sendCheckLogEntry({
-          countryCode,
-          missionCode,
-          vacCode,
-          visaCategoryCode: payload.visaCategoryCode,
-          result: 'rate_limited',
-          errorMessage: 'HTTP 429 Too Many Requests',
-          httpStatus: 429
-        });
 
         await sendPushAlert(
           '⚠️ VFS 429 Rate Limited',
@@ -637,102 +865,29 @@
         return;
       }
 
-      if (!response.ok) {
-        throw new Error(
-          `HTTP ${response.status}`
-        );
+      // A full cycle with at least one 2xx and no 429 -> reset any previous backoff.
+      if (found.length || noSlotCount) {
+        clearBackoffState();
       }
 
-      // Successful 2xx response -> reset any previous 429 backoff state
-      clearBackoffState();
-
-      const data = await response.json();
-
-      console.log(
-        '[VFS Extension] API response:',
-        data
-      );
-
-      if (data && data.earliestDate) {
-
-        console.log(
-          '[VFS Extension] 🚨 SLOT AVAILABLE:',
-          data.earliestDate
-        );
-        showToast(`🚨 VFS SLOT AVAILABLE\nEarliest Available Date: ${data.earliestDate}`);
+      if (errors.length) {
         await sendPushAlert(
-          '🚨 VFS SLOT AVAILABLE',
-          `Earliest Available Date: ${data.earliestDate}`
+          '⚠️ VFS check failed',
+          `${errors.join('; ')}. Will retry automatically.`
         );
-        alert(`🚨 VFS SLOT AVAILABLE\nEarliest Available Date: ${data.earliestDate}`);
-        // Important:
-        // Do NOT stop checking.
-        // It will continue every 3 minutes.
-
-        sendCheckLogEntry({
-          countryCode,
-          missionCode,
-          vacCode,
-          visaCategoryCode: payload.visaCategoryCode,
-          result: 'slot_available',
-          earliestDate: data.earliestDate,
-          httpStatus: response.status
-        });
-      } else {
-       // alert('No slot available');
-        showToast('No slot available', 'error');
-        await sendPushAlert(
-          'No slot available',
-          "Appointment check completed successfully."
-        );
-        console.log(
-          '[VFS Extension] No slot available'
-        );
-
-        sendCheckLogEntry({
-          countryCode,
-          missionCode,
-          vacCode,
-          visaCategoryCode: payload.visaCategoryCode,
-          result: 'no_slot',
-          httpStatus: response.status
-        });
       }
 
     } catch (error) {
 
       console.log(
-        '[VFS Extension] API error:',
+        '[VFS Extension] Check cycle error:',
         error
       );
-
-      // showToast(
-      //   `⚠️ VFS check failed: ${error?.message}. Retrying in 1 min.`,
-      //   'error'
-      // );
 
       await sendPushAlert(
         '⚠️ VFS check failed',
         `${error?.message}. Will retry automatically.`
       );
-
-      {
-        const fallback = getUrlParams();
-        const fallbackMission = fallback.missionCode;
-        const fallbackCountry = fallback.countryCode;
-
-        sendCheckLogEntry({
-          countryCode: fallbackCountry,
-          missionCode: fallbackMission,
-          vacCode: `${fallbackMission}${fallbackCountry}`.toUpperCase(),
-          visaCategoryCode: 'EmployL',
-          result: 'error',
-          errorMessage: error?.message,
-          httpStatus: error?.message?.startsWith('HTTP ')
-            ? Number(error.message.slice(5))
-            : null
-        });
-      }
 
     } finally {
 

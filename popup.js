@@ -39,7 +39,6 @@ fileInput.addEventListener('change', (event) => {
         return;
       }
 
-      setStatus(`Loaded ${rows.length} row(s).`, 'success');
       renderPreview(rows);
       populateRowPicker(rows);
 
@@ -48,12 +47,11 @@ fileInput.addEventListener('change', (event) => {
       const rowToSend = rows[0] || {};
       const sourceCountry = rowToSend.source || 'default';
       const destinationCountry = rowToSend.destination || 'default';
-      const usernameValue = rowToSend.email || rowToSend.user || rowToSend.username || '';
-      const passwordValue = rowToSend.password || rowToSend.pass || '';
 
       const baseVfsUrl = `https://visa.vfsglobal.com/${sourceCountry || 'default'}/en/${destinationCountry || 'default'}`;
       console.log('[VFS Extension] Redirecting active tab to base VFS URL:', baseVfsUrl);
-      saveAutofillCredentials(usernameValue, passwordValue);
+      const { targets, invalid } = saveRowConfig(rowToSend);
+      setStatus(`Loaded ${rows.length} row(s). ${describeTargets(targets, invalid)}`, invalid.length ? 'error' : 'success');
       await redirectToVfsLogin(sourceCountry, destinationCountry);
     } catch (err) {
       setStatus(`Error parsing file: ${err.message}`, 'error');
@@ -67,15 +65,43 @@ fileInput.addEventListener('change', (event) => {
   reader.readAsText(file);
 });
 
-function saveAutofillCredentials(usernameValue, passwordValue) {
+const MAX_RECOMMENDED_TARGETS = 4;
+
+// Saves credentials and slot-check targets for content.js. Always overwrites
+// vfsSlotTargets so centers from a previous upload are never checked by mistake;
+// an empty list makes content.js fall back to its legacy single check.
+function saveRowConfig(row) {
+  const usernameValue = row.email || row.user || row.username || '';
+  const passwordValue = row.password || row.pass || '';
+  const { targets, invalid } = parseSlotTargets(findSlotTargetColumn(row));
+
   try {
     chrome.storage.local.set({
-      vfsAutofillUsername: usernameValue || '',
-      vfsAutofillPassword: passwordValue || ''
+      vfsAutofillUsername: usernameValue,
+      vfsAutofillPassword: passwordValue,
+      vfsSlotTargets: targets
     });
   } catch (e) {
-    console.error('[VFS Extension] Failed to save credentials to storage:', e);
+    console.error('[VFS Extension] Failed to save row config to storage:', e);
   }
+
+  console.log('[VFS Extension] Saved slot targets:', targets, 'invalid:', invalid);
+  return { targets, invalid };
+}
+
+function describeTargets(targets, invalid) {
+  const parts = [];
+  if (targets.length) {
+    const list = targets.map((t) => `${t.vacCode || '(auto)'}|${t.visaCategoryCode}`).join(', ');
+    parts.push(`Centers: ${list}.`);
+  } else {
+    parts.push('No centers found, using default check.');
+  }
+  if (invalid.length) parts.push(`Invalid: ${invalid.join(', ')}.`);
+  if (targets.length > MAX_RECOMMENDED_TARGETS) {
+    parts.push(`${targets.length} centers per cycle may trigger rate limits.`);
+  }
+  return parts.join(' ');
 }
 
 async function redirectToVfsLogin(sourceCountry, destinationCountry) {
@@ -139,7 +165,9 @@ autofillBtn.addEventListener('click', async () => {
 
   const usernameValue = row.email || row.user || row.username || '';
   const passwordValue = row.password || row.pass || '';
-  saveAutofillCredentials(usernameValue, passwordValue);
+  const { targets, invalid } = saveRowConfig(row);
+  const targetsSummary = describeTargets(targets, invalid);
+  const targetsTone = invalid.length ? 'error' : 'success';
 
   chrome.tabs.sendMessage(tab.id, { type: 'AUTOFILL', row, usernameValue, passwordValue }, (response) => {
     autofillBtn.disabled = false;
@@ -153,7 +181,7 @@ autofillBtn.addEventListener('click', async () => {
       setAutofillStatus('Could not find matching fields on this page.', 'error');
       return;
     }
-    setAutofillStatus(`Filled ${response.filled} field(s). Review and log in manually.`, 'success');
+    setAutofillStatus(`Filled ${response.filled} field(s). ${targetsSummary} Review and log in manually.`, targetsTone);
   });
 });
 
