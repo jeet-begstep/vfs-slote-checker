@@ -370,8 +370,18 @@
       const loginTs = getLoginTime() || 0;
 
       if (value && capturedTs >= loginTs - CLIENT_SOURCE_LOGIN_TOLERANCE_MS) {
+        console.log(
+          `[VFS Extension] ClientSource captured ${Math.round((Date.now() - capturedTs) / 1000)}s ago`
+        );
         return { value, origin: 'captured' };
       }
+
+      console.log(
+        '[VFS Extension] ClientSource not used:',
+        value
+          ? `captured value is older than last login (captured ${new Date(capturedTs).toLocaleTimeString()}, login ${new Date(loginTs).toLocaleTimeString()})`
+          : 'nothing captured yet (is page-hook.js loaded? reload the extension and refresh the tab)'
+      );
     } catch (e) {}
 
     return { value: FALLBACK_CLIENT_SOURCE, origin: 'fallback' };
@@ -612,6 +622,11 @@
       }
 
       if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        console.warn(
+          `[VFS Extension] HTTP ${response.status} for ${target.vacCode}/${target.visaCategoryCode} (ClientSource ${ctx.clientSource.origin}):`,
+          body.slice(0, 300)
+        );
         throw new Error(
           `HTTP ${response.status}`
         );
@@ -729,7 +744,7 @@
       const routeHeader =
         `${countryCode}/en/${missionCode}`;
 
-      const clientSource = getClientSource();
+      const clientSource = { origin: 'hardcoded', value: 'sA0tYVdQTOvTbuf4WtZ2+4RP93P2UfkkQcrsID92/mq0fjQJfmNMwvJFH3wNUYuf+GXSN0DV0O34YxwygRQ2Z5YLOJnroLeqey8HGrhLMSeBUUMte3/aHM9+Yqhxb/wUXXa3nk4zkSG7P3Z2zZ/dqUItxz51t1iVijTdjJcZaQqJczA3NuSZHK3l5hlLJu2IvHoND+UcXVuJD5P+ZxaeTBVsRs56ryKQMgpegd1Pjb1tZRtmcPis7f/jCBn3T/8XsdZJPx9kNWNXysyydYjslQLvs8ahKtxPM2Ayo/Dbh/KT6+qG1zb7LjkteLi1+iC3oNeJ7Y2a+uHRtQsDGZ9NYQ==' }; // was getClientSource()
 
       const targets = await getSlotTargets(legacyVacCode);
 
