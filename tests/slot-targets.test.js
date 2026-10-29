@@ -1,7 +1,88 @@
 // Run: node --test "tests/*.test.js"
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { parseSlotTargets, findSlotTargetColumn } = require('../slot-targets.js');
+const {
+  parseSlotTargets,
+  findSlotTargetColumn,
+  matchCentreOption,
+  vacCodeForCentreText,
+  otherVacCode,
+  planUiTargets,
+  pickCategoryOption,
+  findCategoryColumn
+} = require('../slot-targets.js');
+
+const codes = (targets) => targets.map((t) => `${t.vacCode}${t.extra ? '*' : ''}`);
+
+test('planUiTargets: single selected target checks the other centre first (extra)', () => {
+  assert.deepEqual(codes(planUiTargets([{ vacCode: 'AUH' }], 'AUH')), ['DXB*', 'AUH']);
+});
+
+test('planUiTargets: rotates so an unselected centre goes first', () => {
+  assert.deepEqual(codes(planUiTargets([{ vacCode: 'AUH' }, { vacCode: 'DXB' }], 'AUH')), ['DXB', 'AUH']);
+  assert.deepEqual(codes(planUiTargets([{ vacCode: 'AUH' }, { vacCode: 'DXB' }], 'DXB')), ['AUH', 'DXB']);
+});
+
+test('planUiTargets: keeps order when the first target is not selected', () => {
+  assert.deepEqual(codes(planUiTargets([{ vacCode: 'DXB' }, { vacCode: 'AUH' }], 'AUH')), ['DXB', 'AUH']);
+});
+
+test('planUiTargets: dedupes (AUH|LL and AUH|LLN collapse) and uppercases', () => {
+  assert.deepEqual(codes(planUiTargets([{ vacCode: 'auh' }, { vacCode: 'AUH' }, { vacCode: 'dxb' }], null)), ['AUH', 'DXB']);
+});
+
+test('planUiTargets: legacy null target uses the selected centre', () => {
+  assert.deepEqual(codes(planUiTargets([], 'DXB')), ['AUH*', 'DXB']);
+  assert.deepEqual(codes(planUiTargets([{ vacCode: null }], null)), ['null']);
+});
+
+test('planUiTargets: unknown current centre keeps all targets in order', () => {
+  assert.deepEqual(codes(planUiTargets([{ vacCode: 'AUH' }, { vacCode: 'DXB' }], null)), ['AUH', 'DXB']);
+});
+
+test('otherVacCode returns a different known centre', () => {
+  assert.equal(otherVacCode('AUH'), 'DXB');
+  assert.equal(otherVacCode('DXB'), 'AUH');
+  assert.equal(otherVacCode(null), 'AUH');
+});
+
+const CENTRES = [
+  'Latvia Visa application center- Abu Dhabi',
+  'Latvia Visa application center- Dubai'
+];
+
+test('matchCentreOption picks the centre for each vacCode', () => {
+  assert.equal(matchCentreOption(CENTRES, 'AUH'), 0);
+  assert.equal(matchCentreOption(CENTRES, 'DXB'), 1);
+  assert.equal(matchCentreOption(CENTRES, 'dxb'), 1);
+});
+
+test('matchCentreOption: unknown code -1, null code first option', () => {
+  assert.equal(matchCentreOption(CENTRES, 'SHJ'), -1);
+  assert.equal(matchCentreOption(CENTRES, null), 0);
+  assert.equal(matchCentreOption([], null), -1);
+});
+
+test('matchCentreOption tolerates case and extra whitespace', () => {
+  assert.equal(matchCentreOption(['  LATVIA Visa centre -  ABU   DHABI '], 'AUH'), 0);
+});
+
+test('vacCodeForCentreText maps option text back to a code', () => {
+  assert.equal(vacCodeForCentreText(CENTRES[0]), 'AUH');
+  assert.equal(vacCodeForCentreText(CENTRES[1]), 'DXB');
+  assert.equal(vacCodeForCentreText('Something else'), null);
+  assert.equal(vacCodeForCentreText(''), null);
+});
+
+test('pickCategoryOption prefers "Do not test category"', () => {
+  assert.equal(pickCategoryOption(['Long Stay', 'Do not test category', 'Short Stay']), 1);
+});
+
+test('pickCategoryOption falls back to Long Stay, else -1', () => {
+  assert.equal(pickCategoryOption(['Short Stay', ' long  stay ']), 1);
+  assert.equal(pickCategoryOption(['Short Stay']), -1);
+  assert.equal(pickCategoryOption([]), -1);
+});
 
 test('parses multiple vacCode|category pairs', () => {
   assert.deepEqual(parseSlotTargets('AUH|LL,DXB|LL'), {
@@ -77,4 +158,19 @@ test('mixed legacy and pair cell, and a lone pipe', () => {
     { vacCode: 'DXB', visaCategoryCode: 'LL' }
   ]);
   assert.deepEqual(parseSlotTargets('|'), { targets: [], invalid: ['|'] });
+});
+
+test('pickCategoryOption uses the CSV category: exact, then contains, else -1', () => {
+  const opts = ['Do not test category', 'Long Stay', 'Long Stay Plus'];
+  assert.equal(pickCategoryOption(opts, 'long  stay'), 1);
+  assert.equal(pickCategoryOption(opts, 'plus'), 2);
+  assert.equal(pickCategoryOption(opts, 'Short Stay'), -1);
+  assert.equal(pickCategoryOption(opts, ''), 0);
+});
+
+test('findCategoryColumn reads the category column, blank when missing', () => {
+  assert.equal(findCategoryColumn({ email: 'a', category: ' Long Stay ' }), 'Long Stay');
+  assert.equal(findCategoryColumn({ 'Appointment Category': 'X' }), 'X');
+  assert.equal(findCategoryColumn({ 'vacCode|visaCategoryCode': 'AUH|LL' }), '');
+  assert.equal(findCategoryColumn(null), '');
 });

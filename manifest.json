@@ -53,6 +53,7 @@
         "https://visa.vfsglobal.com/*"
       ],
       "js": [
+        "slot-targets.js",
         "content.js"
       ],
       "run_at": "document_idle"

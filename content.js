@@ -76,7 +76,7 @@
   // -------------------------------------------------------
 
   const LOGIN_TIME_STORAGE_KEY = 'VFS_LAST_LOGIN_TS';
-  const SESSION_MAX_AGE_MS = 29 * 60 * 1000; // 29 minutes
+  const SESSION_MAX_AGE_MS = 27 * 60 * 1000; // 29 minutes
   const SESSION_TIMEOUT_COOLDOWN_MIN = 10; // minutes
 
   function recordLoginTime() {
@@ -339,6 +339,19 @@
 
   // [{vacCode, visaCategoryCode}] parsed from the CSV by the popup (slot-targets.js).
   const SLOT_TARGETS_KEY = 'vfsSlotTargets';
+
+  // Appointment category text from the CSV "category" column ('' = default pick).
+  function getStoredUiCategory() {
+    return new Promise((resolve) => {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+        resolve('');
+        return;
+      }
+      chrome.storage.local.get(['vfsUiCategory'], (result) => {
+        resolve(String((result && result.vfsUiCategory) || '').trim());
+      });
+    });
+  }
 
   function getStoredSlotTargets() {
     return new Promise((resolve) => {
@@ -690,6 +703,417 @@
     }
   }
 
+  // Calls the API once per target, STAGGER_MS apart. Stops at the first 429.
+  async function runApiCycle(targets, ctx) {
+    const results = [];
+
+    for (let i = 0; i < targets.length; i++) {
+      const target = targets[i];
+
+      if (i > 0) {
+        const jitter = Math.round((Math.random() * 2 - 1) * STAGGER_JITTER_MS);
+        await sleep(STAGGER_MS + jitter);
+
+        // User may have navigated away or been logged out during the gap.
+        if (!isApplicationDetailPage() || !getAuthToken()) {
+          console.log(
+            '[VFS Extension] Page or session changed mid-cycle. Skipping remaining targets.'
+          );
+          break;
+        }
+      }
+
+      console.log(
+        `[VFS Extension] Checking ${target.vacCode}/${target.visaCategoryCode} (${i + 1}/${targets.length})`
+      );
+
+      const result = await checkOneTarget(target, ctx);
+      results.push({ label: `${target.vacCode}/${target.visaCategoryCode}`, ...result });
+
+      if (result.status === 'rate_limited') break;
+    }
+
+    return results;
+  }
+
+  // -------------------------------------------------------
+  // UAE DROPDOWN FLOW
+  // The page itself calls CheckIsSlotAvailable (with a valid ClientSource)
+  // when the dropdowns change; page-hook.js copies the result into
+  // sessionStorage['VFS_LAST_SLOT_RESPONSE'] and we read it from there.
+  // -------------------------------------------------------
+
+  const UI_FLOW_COUNTRIES = ['are'];
+  const UI_STEP_GAP_MS = 10000; // wait before every dropdown selection
+  const RESPONSE_WAIT_MS = 20000;
+  // Pause between finishing one centre and starting the next (the page answered "Repeated Delay", code 33, to faster switching).
+  const CENTRE_GAP_MS = 20000;
+  // HTTP 409 + retry-after: the page shows a countdown (max ~30s), closes it and re-sends the call itself.
+  const RETRY_WAIT_MS = 40000;
+  // Worst case for one centre: 3 gated steps + response wait + slack.
+  const UI_TARGET_BUDGET_MS = 3 * UI_STEP_GAP_MS + RESPONSE_WAIT_MS + RETRY_WAIT_MS + CENTRE_GAP_MS + 15000;
+  const SLOT_RESPONSE_STORAGE_KEY = 'VFS_LAST_SLOT_RESPONSE';
+
+  const UI_LABELS = {
+    centre: 'choose your application centre',
+    category: 'choose your appointment category',
+    subCategory: 'choose your sub-category'
+  };
+
+  // Innermost element whose text contains labelText.
+  function findLabelElement(labelText) {
+    const candidates = Array.from(
+      document.querySelectorAll('mat-label, label, legend, h1, h2, h3, h4, h5, h6, p, span, div')
+    ).filter((el) =>
+      normalizeOptionText(el.textContent).includes(labelText) &&
+      // Text inside a dropdown (placeholder, selected value) is not the label.
+      !el.closest('mat-select')
+    );
+
+    return candidates.find((el) =>
+      !Array.from(el.children).some((child) => normalizeOptionText(child.textContent).includes(labelText))
+    ) || null;
+  }
+
+  // First mat-select after the label, in the nearest ancestor that contains one.
+  function findSelectByLabel(labelText) {
+    const labelEl = findLabelElement(labelText);
+    if (!labelEl) return null;
+
+    for (let node = labelEl.parentElement; node && node !== document.body; node = node.parentElement) {
+      const select = Array.from(node.querySelectorAll('mat-select')).find((s) =>
+        labelEl.compareDocumentPosition(s) & Node.DOCUMENT_POSITION_FOLLOWING
+      );
+      if (select) return select;
+    }
+
+    return null;
+  }
+
+  function selectedText(select) {
+    const el = select && select.querySelector('.mat-mdc-select-value-text, .mat-select-value-text');
+    return el ? el.textContent.replace(/\s+/g, ' ').trim() : '';
+  }
+
+  function isSelectDisabled(select) {
+    return select.getAttribute('aria-disabled') === 'true' ||
+      select.classList.contains('mat-mdc-select-disabled') ||
+      select.classList.contains('mat-select-disabled');
+  }
+
+  function getOpenOptions() {
+    const overlay = document.querySelector('.cdk-overlay-container');
+    if (!overlay) return [];
+    let options = Array.from(overlay.querySelectorAll('mat-option'));
+    if (!options.length) options = Array.from(overlay.querySelectorAll('[role="option"]'));
+    return options.filter(isElementVisible);
+  }
+
+  function optionText(option) {
+    const el = option.querySelector('.mdc-list-item__primary-text, .mat-option-text') || option;
+    return el.textContent.replace(/\s+/g, ' ').trim();
+  }
+
+  async function openSelect(select) {
+    const trigger = select.querySelector('.mat-mdc-select-trigger, .mat-select-trigger') || select;
+    trigger.click();
+
+    for (let i = 0; i < 30; i++) {
+      const options = getOpenOptions();
+      if (options.length) return options;
+      await sleep(100);
+    }
+
+    return [];
+  }
+
+  // waitForAutoClose: true after clicking an option (the panel closes itself);
+  // false when nothing was clicked, so the panel is still open on purpose.
+  async function closeSelectPanel(waitForAutoClose = true) {
+    // The panel normally closes by itself after an option click (~200ms
+    // animation), so give it time before sending anything.
+    for (let i = 0; waitForAutoClose && i < 4 && getOpenOptions().length; i++) await sleep(150);
+    if (!getOpenOptions().length) return;
+
+    (document.activeElement || document.body).dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true })
+    );
+    await sleep(300);
+    if (!getOpenOptions().length) return;
+
+    // Last resort: the most recently opened backdrop (our panel's), never the
+    // first one, which could belong to a dialog.
+    const backdrops = document.querySelectorAll('.cdk-overlay-transparent-backdrop, .cdk-overlay-backdrop');
+    const backdrop = backdrops[backdrops.length - 1];
+    if (backdrop) backdrop.click();
+
+    await sleep(300);
+  }
+
+  // Opens the dropdown under labelText, clicks option pickIndex(texts), closes it.
+  // A disabled or single-option dropdown that already has a value is skipped.
+  async function uiSelect(labelText, pickIndex) {
+    const select = findSelectByLabel(labelText);
+    if (!select) return { ok: false, error: `dropdown not found: ${labelText}` };
+
+    const current = selectedText(select);
+
+    if (isSelectDisabled(select)) {
+      return current
+        ? { ok: true, skipped: true, text: current }
+        : { ok: false, error: `dropdown disabled: ${labelText}` };
+    }
+
+    const options = await openSelect(select);
+    if (!options.length) {
+      await closeSelectPanel(false);
+      return { ok: false, error: `no options: ${labelText}` };
+    }
+
+    const texts = options.map(optionText);
+    const idx = pickIndex(texts);
+
+    // A single option the page already selected: nothing to do, but only if it
+    // is the one we want (otherwise fall through to the "no matching option"
+    // error instead of waiting for a response that will never match).
+    if (texts.length === 1 && current && idx === 0) {
+      await closeSelectPanel(false);
+      return { ok: true, skipped: true, text: current };
+    }
+
+    if (idx < 0) {
+      await closeSelectPanel(false);
+      return { ok: false, error: `no matching option for ${labelText}: ${texts.join(' | ')}` };
+    }
+
+    const unchanged = normalizeOptionText(texts[idx]) === normalizeOptionText(current);
+    const clickedAt = Date.now();
+    options[idx].click();
+    await sleep(500);
+    await closeSelectPanel();
+
+    return { ok: true, text: texts[idx], clickedAt, unchanged };
+  }
+
+  function readSlotResponse() {
+    try {
+      return JSON.parse(sessionStorage.getItem(SLOT_RESPONSE_STORAGE_KEY) || 'null');
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // The page may call the API at step 2 (sub-category auto-selected) or at
+  // step 3, so prefer a response after the last click, else accept any
+  // response since step 1 began.
+  async function waitForPageResponse(sinceTs, lastActionTs, vacCode) {
+    const matches = (record, fromTs) =>
+      record &&
+      record.ts >= fromTs &&
+      (!vacCode || !record.vacCode || String(record.vacCode).toUpperCase() === vacCode);
+
+    let deadline = Date.now() + RESPONSE_WAIT_MS;
+    let pending409 = null; // last 409 seen: wait for the page's automatic retry
+    while (Date.now() < deadline) {
+      const record = readSlotResponse();
+      if (matches(record, lastActionTs) && (!pending409 || record.ts > pending409.ts)) {
+        if (record.status !== 409) return record;
+        console.log('[VFS Extension] HTTP 409 from page, waiting for its automatic retry');
+        pending409 = record;
+        deadline = Date.now() + RETRY_WAIT_MS;
+      }
+      await sleep(500);
+    }
+
+    if (pending409) return pending409; // no retry arrived: reported as HTTP 409
+    const record = readSlotResponse();
+    return matches(record, sinceTs) ? record : null;
+  }
+
+  function finishUiTarget(target, ctx, label, categoryText, result) {
+    const resultName = {
+      slot: 'slot_available',
+      none: 'no_slot',
+      rate_limited: 'rate_limited',
+      error: 'error'
+    }[result.status];
+
+    sendCheckLogEntry({
+      countryCode: ctx.countryCode,
+      missionCode: ctx.missionCode,
+      vacCode: target.vacCode,
+      visaCategoryCode: categoryText,
+      clientSourceOrigin: 'page',
+      result: resultName,
+      earliestDate: result.earliestDate || null,
+      errorMessage: result.errorMessage || null,
+      httpStatus: result.httpStatus || null
+    });
+
+    if (result.status === 'error') {
+      console.warn(`[VFS Extension] ${label}: ${result.errorMessage}`);
+    }
+
+    return { label, extra: Boolean(target.extra), ...result };
+  }
+
+  // Centre -> category -> sub-category, UI_STEP_GAP_MS before each, then the
+  // page's own response. Never throws.
+  async function runUiFlowTarget(target, ctx) {
+    const label = `${target.vacCode || 'centre'}${target.extra ? ' (switch)' : ''}`;
+    const sinceTs = Date.now();
+    const expected = []; // what we set, for the user-interaction guard
+    let lastActionTs = sinceTs;
+    let categoryText = null;
+    let centreUnchanged = false;
+
+    const steps = [
+      { label: UI_LABELS.centre, pick: (texts) => matchCentreOption(texts, target.vacCode) },
+      { label: UI_LABELS.category, pick: (texts) => pickCategoryOption(texts, ctx.uiCategory) },
+      { label: UI_LABELS.subCategory, pick: (texts) => (texts.length ? 0 : -1) }
+    ];
+
+    try {
+      for (const step of steps) {
+        await sleep(UI_STEP_GAP_MS);
+
+        if (!isApplicationDetailPage() || !getAuthToken()) {
+          return finishUiTarget(target, ctx, label, categoryText, {
+            status: 'error',
+            errorMessage: 'page or session changed mid-cycle',
+            abort: true
+          });
+        }
+
+        // Only a dropdown that exists and shows a different value counts; one
+        // that is briefly missing (Angular re-render) or empty is not the user.
+        const changed = expected.find((e) => {
+          const now = normalizeOptionText(selectedText(findSelectByLabel(e.label)));
+          return now && now !== normalizeOptionText(e.text);
+        });
+        if (changed) {
+          return finishUiTarget(target, ctx, label, categoryText, {
+            status: 'error',
+            errorMessage: `user interaction detected (${changed.label})`,
+            abort: true
+          });
+        }
+
+        const result = await uiSelect(step.label, step.pick);
+        if (!result.ok) {
+          return finishUiTarget(target, ctx, label, categoryText, {
+            status: 'error',
+            errorMessage: result.error
+          });
+        }
+
+        console.log(
+          `[VFS Extension] ${label}: ${step.label} -> ${result.skipped ? `skipped (single option: ${result.text})` : result.text}`
+        );
+
+        if (result.clickedAt) lastActionTs = result.clickedAt;
+        if (step.label === UI_LABELS.centre) centreUnchanged = Boolean(result.unchanged || result.skipped);
+        if (step.label === UI_LABELS.category) categoryText = result.text;
+        expected.push({ label: step.label, text: result.text });
+      }
+
+      if (centreUnchanged) {
+        console.warn(
+          `[VFS Extension] ${label}: centre was already selected; the page may not re-check it.`
+        );
+      }
+
+      const record = await waitForPageResponse(sinceTs, lastActionTs, target.vacCode);
+
+      if (!record) {
+        return finishUiTarget(target, ctx, label, categoryText, {
+          status: 'error',
+          errorMessage: centreUnchanged
+            ? 'no response from page (centre unchanged, nothing to re-check)'
+            : 'no response from page'
+        });
+      }
+
+      console.log(`[VFS Extension] ${label}: page response`, record);
+
+      if (record.status === 429) {
+        return finishUiTarget(target, ctx, label, categoryText, { status: 'rate_limited', httpStatus: 429 });
+      }
+
+      if (record.status < 200 || record.status >= 300) {
+        return finishUiTarget(target, ctx, label, categoryText, {
+          status: 'error',
+          errorMessage: `HTTP ${record.status}`,
+          httpStatus: record.status
+        });
+      }
+
+      if (record.earliestDate) {
+        return finishUiTarget(target, ctx, label, categoryText, {
+          status: 'slot',
+          earliestDate: record.earliestDate,
+          httpStatus: record.status
+        });
+      }
+
+      return finishUiTarget(target, ctx, label, categoryText, { status: 'none', httpStatus: record.status });
+
+    } catch (error) {
+      await closeSelectPanel().catch(() => {});
+      return finishUiTarget(target, ctx, label, categoryText, {
+        status: 'error',
+        errorMessage: error?.message || String(error)
+      });
+    }
+  }
+
+  async function runUiFlowCycle(rawTargets, ctx) {
+    const centreSelect = findSelectByLabel(UI_LABELS.centre);
+
+    if (!centreSelect) {
+      return [finishUiTarget({ vacCode: null }, ctx, 'centre', null, {
+        status: 'error',
+        errorMessage: `dropdown not found: ${UI_LABELS.centre}`
+      })];
+    }
+
+    const currentCode = vacCodeForCentreText(selectedText(centreSelect));
+
+    // Raw stored targets keep vacCode null for legacy CSVs -> the selected
+    // (or first) centre. The CSV category is not used on this flow, so
+    // AUH|LL and AUH|LLN collapse to one centre. See planUiTargets().
+    const targets = planUiTargets(rawTargets, currentCode);
+
+    console.log(
+      '[VFS Extension] UI flow targets:',
+      targets.map((t) => `${t.vacCode || 'first'}${t.extra ? ' (switch)' : ''}`).join(', '),
+      '| currently selected:',
+      currentCode || 'unknown'
+    );
+
+    const results = [];
+
+    for (const [i, target] of targets.entries()) {
+      if (i > 0) await sleep(CENTRE_GAP_MS);
+
+      // A centre takes ~3 steps + the response wait. Don't start one that could
+      // run past the session limit; the next cycle's session check handles the
+      // logout.
+      if (getSessionAgeMs() + UI_TARGET_BUDGET_MS >= SESSION_MAX_AGE_MS) {
+        console.log(
+          '[VFS Extension] Session close to the 29m limit. Skipping remaining centres this cycle.'
+        );
+        break;
+      }
+
+      const result = await runUiFlowTarget(target, ctx);
+      results.push(result);
+      if (result.status === 'rate_limited' || result.abort) break;
+    }
+
+    return results;
+  }
+
   async function checkSlots() {
 
     if (!isApplicationDetailPage()) {
@@ -798,51 +1222,38 @@
         missionCode,
         routeHeader,
         loginUser: creds.username,
-        clientSource
+        clientSource,
+        uiCategory: UI_FLOW_COUNTRIES.includes(countryCode) ? await getStoredUiCategory() : ''
       };
+
+      // UAE: drive the page's dropdowns and read the page's own API response
+      // (our own call gets 401 there). Everything else: call the API directly.
+      const results = UI_FLOW_COUNTRIES.includes(countryCode)
+        ? await runUiFlowCycle(await getStoredSlotTargets(), ctx)
+        : await runApiCycle(targets, ctx);
 
       const found = [];
       const errors = [];
       let noSlotCount = 0;
       let rateLimited = false;
 
-      for (let i = 0; i < targets.length; i++) {
-        const target = targets[i];
-
-        if (i > 0) {
-          const jitter = Math.round((Math.random() * 2 - 1) * STAGGER_JITTER_MS);
-          await sleep(STAGGER_MS + jitter);
-
-          // User may have navigated away or been logged out during the gap.
-          if (!isApplicationDetailPage() || !getAuthToken()) {
-            console.log(
-              '[VFS Extension] Page or session changed mid-cycle. Skipping remaining targets.'
-            );
-            break;
-          }
-        }
-
-        console.log(
-          `[VFS Extension] Checking ${target.vacCode}/${target.visaCategoryCode} (${i + 1}/${targets.length})`
-        );
-
-        const result = await checkOneTarget(target, ctx);
+      results.forEach((result) => {
+        // The "(switch)" centre exists only to make the page re-check; its
+        // result goes to the Sheet but never alerts or counts. A 429 still counts.
+        if (result.extra && result.status !== 'rate_limited') return;
 
         if (result.status === 'rate_limited') {
-          // Skip the remaining targets, but still alert on any slot found
+          // Remaining targets were skipped, but still alert on any slot found
           // earlier in this cycle before logging out (handled below).
           rateLimited = true;
-          break;
-        }
-
-        if (result.status === 'slot') {
-          found.push(`${target.vacCode}/${target.visaCategoryCode}: ${result.earliestDate}`);
+        } else if (result.status === 'slot') {
+          found.push(`${result.label}: ${result.earliestDate}`);
         } else if (result.status === 'none') {
           noSlotCount += 1;
         } else {
-          errors.push(`${target.vacCode}/${target.visaCategoryCode}: ${result.errorMessage}`);
+          errors.push(`${result.label}: ${result.errorMessage}`);
         }
-      }
+      });
 
       // One combined alert per cycle. alert() blocks, so it runs only after
       // every target has been checked.

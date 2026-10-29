@@ -32,21 +32,100 @@
     return key ? headers[key] : null;
   }
 
+  // --- Page's own CheckIsSlotAvailable responses (UAE dropdown flow) -------
+  // content.js drives the dropdowns; the page makes the call with a valid
+  // ClientSource, and we copy the result here. Only dates/status are stored.
+
+  const SLOT_PATH = '/appointment/CheckIsSlotAvailable';
+  let warnedResponseType = false;
+
+  function isSlotUrl(url) {
+    return String(url || '').includes(API_HOST) && String(url || '').includes(SLOT_PATH);
+  }
+
+  function recordSlotResponse(requestBody, status, data) {
+    try {
+      let req = {};
+      try {
+        req = typeof requestBody === 'string' ? JSON.parse(requestBody) : {};
+      } catch (e) {}
+      sessionStorage.setItem('VFS_LAST_SLOT_RESPONSE', JSON.stringify({
+        ts: Date.now(),
+        status: Number(status) || 0,
+        vacCode: (req && req.vacCode) || null,
+        visaCategoryCode: (req && req.visaCategoryCode) || null,
+        earliestDate: (data && data.earliestDate) || null
+      }));
+    } catch (e) {}
+  }
+
   const originalFetch = window.fetch;
   if (typeof originalFetch === 'function') {
     window.fetch = function (input, init) {
+      let slotBody = null;
       try {
         const isRequest = typeof Request !== 'undefined' && input instanceof Request;
         const url = isRequest ? input.url : input;
         const value = readHeader(init && init.headers) || (isRequest ? readHeader(input.headers) : null);
         record(url, value);
+        if (isSlotUrl(url)) {
+          // A Request's body is consumed by fetch, so read it from a clone taken first.
+          slotBody = init && typeof init.body === 'string'
+            ? Promise.resolve(init.body)
+            : (isRequest ? input.clone().text() : Promise.resolve(null));
+          // Handled here so a rejected clone never surfaces as an unhandled rejection in the page.
+          slotBody.catch(() => {});
+        }
       } catch (e) {}
-      return originalFetch.apply(this, arguments);
+
+      const result = originalFetch.apply(this, arguments);
+
+      if (slotBody) {
+        // Side branch only: the page still gets `result` untouched.
+        Promise.resolve(result)
+          .then((res) => Promise.all([
+            slotBody.catch(() => null),
+            res.clone().json().catch(() => null)
+          ]).then(([body, data]) => recordSlotResponse(body, res.status, data)))
+          .catch(() => {});
+      }
+
+      return result;
     };
   }
 
   const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
   const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+  XMLHttpRequest.prototype.send = function (body) {
+    try {
+      if (isSlotUrl(this.__vfsUrl)) {
+        const xhr = this;
+        xhr.addEventListener('loadend', () => {
+          try {
+            // loadend also fires on abort/error/timeout (status 0): not a response.
+            if (!xhr.status) return;
+            let data = null;
+            const type = xhr.responseType;
+            // responseText throws for non-text responseTypes, so read by type.
+            if (type === 'json') {
+              data = xhr.response;
+            } else if (type === '' || type === 'text') {
+              try {
+                data = JSON.parse(xhr.responseText);
+              } catch (e) {}
+            } else if (!warnedResponseType) {
+              warnedResponseType = true;
+              console.warn('[VFS Extension] page-hook: unsupported responseType', type);
+            }
+            recordSlotResponse(typeof body === 'string' ? body : null, xhr.status, data);
+          } catch (e) {}
+        }, { once: true });
+      }
+    } catch (e) {}
+    return originalSend.apply(this, arguments);
+  };
 
   XMLHttpRequest.prototype.open = function (method, url) {
     try {

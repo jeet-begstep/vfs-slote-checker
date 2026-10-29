@@ -79,7 +79,8 @@ function saveRowConfig(row) {
     chrome.storage.local.set({
       vfsAutofillUsername: usernameValue,
       vfsAutofillPassword: passwordValue,
-      vfsSlotTargets: targets
+      vfsSlotTargets: targets,
+      vfsUiCategory: findCategoryColumn(row)
     });
   } catch (e) {
     console.error('[VFS Extension] Failed to save row config to storage:', e);
