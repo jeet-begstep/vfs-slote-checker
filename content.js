@@ -10,8 +10,16 @@
   window.__VFS_SLOT_CHECKER_RUNNING__ = true;
 
   const CHECK_INTERVAL_MS = 2.5 * 60 * 1000; // 2.5 minutes
+  const STAGGER_MS = 30000; // gap between centers within one cycle
+  const STAGGER_JITTER_MS = 2000;
+  const LEGACY_VISA_CATEGORY_CODE = 'EmployL';
   const API_URL =
     'https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable';
+
+  // Used only when page-hook.js hasn't captured the page's own ClientSource
+  // since the last login.
+  const FALLBACK_CLIENT_SOURCE =
+    'imMG/l4MmYDsEvVPyHan3Tsc8dbxyD66qU4ZBAHKdDpkczriHRLjkHzXgYB97EXeat02vIldwprT+J+KOiXkH6btSCRq92U2f91aTt/B5XSq2XBUxYbA5OuL8CG3bnyxGChchENtdnUGvQz8eF4mZJjBy84dgS78ETWrQZnCFY+TLVbCzZ635iwf2JGwZjE5gC2p6ejNFdTrRQZmfmVbms7mH5Z4cALUUuFS3XjYxzYJmFmz/i+3Bg+V8Jg0o7OGs0xcfpbQs/Cij2PtjSqrgE0JJxiEmNLJFwZvDYplnZSK0PcttKJMJX9NkCwyIcXHePVVcfMzF26y5bJTtyGtlQ==';
 
   let timer = null;
   let checking = false;
@@ -64,12 +72,12 @@
   const BACKOFF_STORAGE_KEY_REASON = 'VFS_429_REASON';
 
   // -------------------------------------------------------
-  // SESSION AGE TRACKING (force re-login every 29 minutes)
+  // SESSION AGE TRACKING (force re-login every 23 minutes)
   // -------------------------------------------------------
 
   const LOGIN_TIME_STORAGE_KEY = 'VFS_LAST_LOGIN_TS';
-  const SESSION_MAX_AGE_MS = 29 * 60 * 1000; // 29 minutes
-  const SESSION_TIMEOUT_COOLDOWN_MIN = 10; // minutes
+  const SESSION_MAX_AGE_MS = 23 * 60 * 1000; // 23 minutes
+  const SESSION_TIMEOUT_COOLDOWN_MIN = 5; // minutes
 
   function recordLoginTime() {
     try {
@@ -329,6 +337,98 @@
     chrome.storage.local.remove([AUTOFILL_USERNAME_KEY, AUTOFILL_PASSWORD_KEY]);
   }
 
+  // Account rotation: popup stores every CSV row in vfsAccounts; on each session
+  // timeout we advance vfsAccountIndex (a -> b -> c -> a ...) and copy that
+  // account's credentials/targets/category into the keys the login + checker read.
+  async function rotateToNextAccount() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return null;
+    const data = await new Promise((resolve) =>
+      chrome.storage.local.get(['vfsAccounts', 'vfsAccountIndex'], resolve)
+    );
+    const accounts = Array.isArray(data && data.vfsAccounts) ? data.vfsAccounts : [];
+    if (!accounts.length) return null;
+    const current = Number(data.vfsAccountIndex) || 0;
+    const next = (current + 1) % accounts.length;
+    const acc = accounts[next];
+    await new Promise((resolve) =>
+      chrome.storage.local.set(
+        {
+          vfsAccountIndex: next,
+          vfsAutofillUsername: acc.username,
+          vfsAutofillPassword: acc.password,
+          vfsSlotTargets: acc.targets || [],
+          vfsUiCategory: acc.category || ''
+        },
+        resolve
+      )
+    );
+    console.log(`[VFS Extension] Rotated account ${current} -> ${next} (${acc.username})`);
+    return acc.username;
+  }
+
+  // [{vacCode, visaCategoryCode}] parsed from the CSV by the popup (slot-targets.js).
+  const SLOT_TARGETS_KEY = 'vfsSlotTargets';
+
+  // Appointment category text from the CSV "category" column ('' = default pick).
+  function getStoredUiCategory() {
+    return new Promise((resolve) => {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+        resolve('');
+        return;
+      }
+      chrome.storage.local.get(['vfsUiCategory'], (result) => {
+        resolve(String((result && result.vfsUiCategory) || '').trim());
+      });
+    });
+  }
+
+  function getStoredSlotTargets() {
+    return new Promise((resolve) => {
+      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) {
+        resolve([]);
+        return;
+      }
+      chrome.storage.local.get([SLOT_TARGETS_KEY], (result) => {
+        const targets = result && result[SLOT_TARGETS_KEY];
+        resolve(Array.isArray(targets) ? targets.filter((t) => t && t.visaCategoryCode) : []);
+      });
+    });
+  }
+
+  // -------------------------------------------------------
+  // CLIENT SOURCE (captured from the page by page-hook.js)
+  // -------------------------------------------------------
+
+  const CLIENT_SOURCE_STORAGE_KEY = 'VFS_CLIENT_SOURCE';
+  const CLIENT_SOURCE_TS_STORAGE_KEY = 'VFS_CLIENT_SOURCE_TS';
+  // The page sends lift-api requests during login, slightly before the dashboard
+  // watcher stamps VFS_LAST_LOGIN_TS. Anything older is from a previous session.
+  const CLIENT_SOURCE_LOGIN_TOLERANCE_MS = 2 * 60 * 1000;
+
+  function getClientSource() {
+    try {
+      const value = sessionStorage.getItem(CLIENT_SOURCE_STORAGE_KEY);
+      const capturedTs = Number(sessionStorage.getItem(CLIENT_SOURCE_TS_STORAGE_KEY) || 0);
+      const loginTs = getLoginTime() || 0;
+
+      if (value && capturedTs >= loginTs - CLIENT_SOURCE_LOGIN_TOLERANCE_MS) {
+        console.log(
+          `[VFS Extension] ClientSource captured ${Math.round((Date.now() - capturedTs) / 1000)}s ago`
+        );
+        return { value, origin: 'captured' };
+      }
+
+      console.log(
+        '[VFS Extension] ClientSource not used:',
+        value
+          ? `captured value is older than last login (captured ${new Date(capturedTs).toLocaleTimeString()}, login ${new Date(loginTs).toLocaleTimeString()})`
+          : 'nothing captured yet (is page-hook.js loaded? reload the extension and refresh the tab)'
+      );
+    } catch (e) {}
+
+    return { value: FALLBACK_CLIENT_SOURCE, origin: 'fallback' };
+  }
+
   // -------------------------------------------------------
   // TOKEN
   // -------------------------------------------------------
@@ -449,6 +549,7 @@
     missionCode,
     vacCode,
     visaCategoryCode,
+    clientSourceOrigin = null,
     result,
     earliestDate = null,
     errorMessage = null,
@@ -460,6 +561,7 @@
       missionCode,
       vacCode,
       visaCategoryCode,
+      clientSourceOrigin,
       result,
       earliestDate,
       errorMessage,
@@ -473,8 +575,575 @@
   // CHECK SLOT
   // -------------------------------------------------------
 
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Resolves stored targets to concrete {vacCode, visaCategoryCode} pairs.
+  // vacCode null (legacy "EmployL" CSV) or no stored targets -> derived vacCode,
+  // which preserves the pre-multi-center behaviour.
+  async function getSlotTargets(legacyVacCode) {
+    const stored = await getStoredSlotTargets();
+
+    if (!stored.length) {
+      return [{ vacCode: legacyVacCode, visaCategoryCode: LEGACY_VISA_CATEGORY_CODE }];
+    }
+
+    return stored.map((target) => ({
+      vacCode: target.vacCode || legacyVacCode,
+      visaCategoryCode: target.visaCategoryCode
+    }));
+  }
+
+  // One API call for one center/category. Never throws.
+  async function checkOneTarget(target, ctx) {
+    const logBase = {
+      countryCode: ctx.countryCode,
+      missionCode: ctx.missionCode,
+      vacCode: target.vacCode,
+      visaCategoryCode: target.visaCategoryCode,
+      clientSourceOrigin: ctx.clientSource.origin
+    };
+
+    try {
+      const token = getAuthToken();
+
+      if (!token) {
+        throw new Error('No JWT');
+      }
+
+      const payload = {
+        countryCode: ctx.countryCode,
+        missionCode: ctx.missionCode,
+        vacCode: target.vacCode,
+        visaCategoryCode: target.visaCategoryCode,
+        roleName: 'Individual',
+        loginUser: ctx.loginUser,
+        payCode: ''
+      };
+
+      const response = await fetch(API_URL, {
+        method: 'POST',
+
+        headers: {
+          'Accept':
+            'application/json, text/plain, */*',
+
+          'Accept-Language':
+            'en-GB,en-US;q=0.9,en;q=0.8',
+
+          'Authorize': token,
+
+          'ClientSource': ctx.clientSource.value,
+
+          'Content-Type':
+            'application/json;charset=UTF-8',
+
+          'Route': ctx.routeHeader
+        },
+
+        body: JSON.stringify(payload)
+      });
+
+      console.log(
+        `[VFS Extension] API status (${target.vacCode}/${target.visaCategoryCode}):`,
+        response.status
+      );
+
+      if (response.status === 429) {
+        console.warn('[VFS Extension] 429 Too Many Requests detected');
+
+        sendCheckLogEntry({
+          ...logBase,
+          result: 'rate_limited',
+          errorMessage: 'HTTP 429 Too Many Requests',
+          httpStatus: 429
+        });
+
+        return { status: 'rate_limited' };
+      }
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        console.warn(
+          `[VFS Extension] HTTP ${response.status} for ${target.vacCode}/${target.visaCategoryCode} (ClientSource ${ctx.clientSource.origin}):`,
+          body.slice(0, 300)
+        );
+        throw new Error(
+          `HTTP ${response.status}`
+        );
+      }
+
+      // 2xx: backoff is cleared once per cycle in checkSlots(), not here, so a
+      // 429 on a later center still escalates from the previous attempt count.
+      const data = await response.json();
+
+      console.log(
+        '[VFS Extension] API response:',
+        data
+      );
+
+      if (data && data.earliestDate) {
+        console.log(
+          '[VFS Extension] 🚨 SLOT AVAILABLE:',
+          target.vacCode,
+          data.earliestDate
+        );
+
+        sendCheckLogEntry({
+          ...logBase,
+          result: 'slot_available',
+          earliestDate: data.earliestDate,
+          httpStatus: response.status
+        });
+
+        return { status: 'slot', earliestDate: data.earliestDate };
+      }
+
+      console.log(
+        `[VFS Extension] No slot available at ${target.vacCode}/${target.visaCategoryCode}`
+      );
+
+      sendCheckLogEntry({
+        ...logBase,
+        result: 'no_slot',
+        httpStatus: response.status
+      });
+
+      return { status: 'none' };
+
+    } catch (error) {
+
+      console.log(
+        `[VFS Extension] API error (${target.vacCode}/${target.visaCategoryCode}):`,
+        error
+      );
+
+      sendCheckLogEntry({
+        ...logBase,
+        result: 'error',
+        errorMessage: error?.message,
+        httpStatus: error?.message?.startsWith('HTTP ')
+          ? Number(error.message.slice(5))
+          : null
+      });
+
+      return { status: 'error', errorMessage: error?.message };
+    }
+  }
+
+  // Calls the API once per target, STAGGER_MS apart. Stops at the first 429.
+  async function runApiCycle(targets, ctx) {
+    const results = [];
+
+    for (let i = 0; i < targets.length; i++) {
+      const target = targets[i];
+
+      if (i > 0) {
+        const jitter = Math.round((Math.random() * 2 - 1) * STAGGER_JITTER_MS);
+        await sleep(STAGGER_MS + jitter);
+
+        // User may have navigated away or been logged out during the gap.
+        if (!isApplicationDetailPage() || !getAuthToken()) {
+          console.log(
+            '[VFS Extension] Page or session changed mid-cycle. Skipping remaining targets.'
+          );
+          break;
+        }
+      }
+
+      console.log(
+        `[VFS Extension] Checking ${target.vacCode}/${target.visaCategoryCode} (${i + 1}/${targets.length})`
+      );
+
+      const result = await checkOneTarget(target, ctx);
+      results.push({ label: `${target.vacCode}/${target.visaCategoryCode}`, ...result });
+
+      if (result.status === 'rate_limited') break;
+    }
+
+    return results;
+  }
+
+  // -------------------------------------------------------
+  // UAE DROPDOWN FLOW
+  // The page itself calls CheckIsSlotAvailable (with a valid ClientSource)
+  // when the dropdowns change; page-hook.js copies the result into
+  // sessionStorage['VFS_LAST_SLOT_RESPONSE'] and we read it from there.
+  // -------------------------------------------------------
+
+  const UI_FLOW_COUNTRIES = ['are'];
+  const UI_STEP_GAP_MS = 10000; // wait before every dropdown selection
+  const RESPONSE_WAIT_MS = 20000;
+  // Pause between finishing one centre and starting the next (the page answered "Repeated Delay", code 33, to faster switching).
+  const CENTRE_GAP_MS = 20000;
+  // HTTP 409 + retry-after: the page shows a countdown (max ~30s), closes it and re-sends the call itself.
+  const RETRY_WAIT_MS = 40000;
+  // Worst case for one centre: 3 gated steps + response wait + slack.
+  const UI_TARGET_BUDGET_MS = 3 * UI_STEP_GAP_MS + RESPONSE_WAIT_MS + RETRY_WAIT_MS + CENTRE_GAP_MS + 15000;
+  const SLOT_RESPONSE_STORAGE_KEY = 'VFS_LAST_SLOT_RESPONSE';
+
+  const UI_LABELS = {
+    centre: 'choose your application centre',
+    category: 'choose your appointment category',
+    subCategory: 'choose your sub-category'
+  };
+
+  // Innermost element whose text contains labelText.
+  function findLabelElement(labelText) {
+    const candidates = Array.from(
+      document.querySelectorAll('mat-label, label, legend, h1, h2, h3, h4, h5, h6, p, span, div')
+    ).filter((el) =>
+      normalizeOptionText(el.textContent).includes(labelText) &&
+      // Text inside a dropdown (placeholder, selected value) is not the label.
+      !el.closest('mat-select')
+    );
+
+    return candidates.find((el) =>
+      !Array.from(el.children).some((child) => normalizeOptionText(child.textContent).includes(labelText))
+    ) || null;
+  }
+
+  // First mat-select after the label, in the nearest ancestor that contains one.
+  function findSelectByLabel(labelText) {
+    const labelEl = findLabelElement(labelText);
+    if (!labelEl) return null;
+
+    for (let node = labelEl.parentElement; node && node !== document.body; node = node.parentElement) {
+      const select = Array.from(node.querySelectorAll('mat-select')).find((s) =>
+        labelEl.compareDocumentPosition(s) & Node.DOCUMENT_POSITION_FOLLOWING
+      );
+      if (select) return select;
+    }
+
+    return null;
+  }
+
+  function selectedText(select) {
+    const el = select && select.querySelector('.mat-mdc-select-value-text, .mat-select-value-text');
+    return el ? el.textContent.replace(/\s+/g, ' ').trim() : '';
+  }
+
+  function isSelectDisabled(select) {
+    return select.getAttribute('aria-disabled') === 'true' ||
+      select.classList.contains('mat-mdc-select-disabled') ||
+      select.classList.contains('mat-select-disabled');
+  }
+
+  function getOpenOptions() {
+    const overlay = document.querySelector('.cdk-overlay-container');
+    if (!overlay) return [];
+    let options = Array.from(overlay.querySelectorAll('mat-option'));
+    if (!options.length) options = Array.from(overlay.querySelectorAll('[role="option"]'));
+    return options.filter(isElementVisible);
+  }
+
+  function optionText(option) {
+    const el = option.querySelector('.mdc-list-item__primary-text, .mat-option-text') || option;
+    return el.textContent.replace(/\s+/g, ' ').trim();
+  }
+
+  async function openSelect(select) {
+    const trigger = select.querySelector('.mat-mdc-select-trigger, .mat-select-trigger') || select;
+    trigger.click();
+
+    for (let i = 0; i < 30; i++) {
+      const options = getOpenOptions();
+      if (options.length) return options;
+      await sleep(100);
+    }
+
+    return [];
+  }
+
+  // waitForAutoClose: true after clicking an option (the panel closes itself);
+  // false when nothing was clicked, so the panel is still open on purpose.
+  async function closeSelectPanel(waitForAutoClose = true) {
+    // The panel normally closes by itself after an option click (~200ms
+    // animation), so give it time before sending anything.
+    for (let i = 0; waitForAutoClose && i < 4 && getOpenOptions().length; i++) await sleep(150);
+    if (!getOpenOptions().length) return;
+
+    (document.activeElement || document.body).dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true })
+    );
+    await sleep(300);
+    if (!getOpenOptions().length) return;
+
+    // Last resort: the most recently opened backdrop (our panel's), never the
+    // first one, which could belong to a dialog.
+    const backdrops = document.querySelectorAll('.cdk-overlay-transparent-backdrop, .cdk-overlay-backdrop');
+    const backdrop = backdrops[backdrops.length - 1];
+    if (backdrop) backdrop.click();
+
+    await sleep(300);
+  }
+
+  // Opens the dropdown under labelText, clicks option pickIndex(texts), closes it.
+  // A disabled or single-option dropdown that already has a value is skipped.
+  async function uiSelect(labelText, pickIndex) {
+    const select = findSelectByLabel(labelText);
+    if (!select) return { ok: false, error: `dropdown not found: ${labelText}` };
+
+    const current = selectedText(select);
+
+    if (isSelectDisabled(select)) {
+      return current
+        ? { ok: true, skipped: true, text: current }
+        : { ok: false, error: `dropdown disabled: ${labelText}` };
+    }
+
+    const options = await openSelect(select);
+    if (!options.length) {
+      await closeSelectPanel(false);
+      return { ok: false, error: `no options: ${labelText}` };
+    }
+
+    const texts = options.map(optionText);
+    const idx = pickIndex(texts);
+
+    // A single option the page already selected: nothing to do, but only if it
+    // is the one we want (otherwise fall through to the "no matching option"
+    // error instead of waiting for a response that will never match).
+    if (texts.length === 1 && current && idx === 0) {
+      await closeSelectPanel(false);
+      return { ok: true, skipped: true, text: current };
+    }
+
+    if (idx < 0) {
+      await closeSelectPanel(false);
+      return { ok: false, error: `no matching option for ${labelText}: ${texts.join(' | ')}` };
+    }
+
+    const unchanged = normalizeOptionText(texts[idx]) === normalizeOptionText(current);
+    const clickedAt = Date.now();
+    options[idx].click();
+    await sleep(500);
+    await closeSelectPanel();
+
+    return { ok: true, text: texts[idx], clickedAt, unchanged };
+  }
+
+  function readSlotResponse() {
+    try {
+      return JSON.parse(sessionStorage.getItem(SLOT_RESPONSE_STORAGE_KEY) || 'null');
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // The page may call the API at step 2 (sub-category auto-selected) or at
+  // step 3, so prefer a response after the last click, else accept any
+  // response since step 1 began.
+  async function waitForPageResponse(sinceTs, lastActionTs, vacCode) {
+    const matches = (record, fromTs) =>
+      record &&
+      record.ts >= fromTs &&
+      (!vacCode || !record.vacCode || String(record.vacCode).toUpperCase() === vacCode);
+
+    let deadline = Date.now() + RESPONSE_WAIT_MS;
+    let pending409 = null; // last 409 seen: wait for the page's automatic retry
+    while (Date.now() < deadline) {
+      const record = readSlotResponse();
+      if (matches(record, lastActionTs) && (!pending409 || record.ts > pending409.ts)) {
+        if (record.status !== 409) return record;
+        console.log('[VFS Extension] HTTP 409 from page, waiting for its automatic retry');
+        pending409 = record;
+        deadline = Date.now() + RETRY_WAIT_MS;
+      }
+      await sleep(500);
+    }
+
+    if (pending409) return pending409; // no retry arrived: reported as HTTP 409
+    const record = readSlotResponse();
+    return matches(record, sinceTs) ? record : null;
+  }
+
+  function finishUiTarget(target, ctx, label, categoryText, result) {
+    const resultName = {
+      slot: 'slot_available',
+      none: 'no_slot',
+      rate_limited: 'rate_limited',
+      error: 'error'
+    }[result.status];
+
+    sendCheckLogEntry({
+      countryCode: ctx.countryCode,
+      missionCode: ctx.missionCode,
+      vacCode: target.vacCode,
+      visaCategoryCode: categoryText,
+      clientSourceOrigin: 'page',
+      result: resultName,
+      earliestDate: result.earliestDate || null,
+      errorMessage: result.errorMessage || null,
+      httpStatus: result.httpStatus || null
+    });
+
+    if (result.status === 'error') {
+      console.warn(`[VFS Extension] ${label}: ${result.errorMessage}`);
+    }
+
+    return { label, extra: Boolean(target.extra), ...result };
+  }
+
+  // Centre -> category -> sub-category, UI_STEP_GAP_MS before each, then the
+  // page's own response. Never throws.
+  async function runUiFlowTarget(target, ctx) {
+    const label = `${target.vacCode || 'centre'}${target.extra ? ' (switch)' : ''}`;
+    const sinceTs = Date.now();
+    const expected = []; // what we set, for the user-interaction guard
+    let lastActionTs = sinceTs;
+    let categoryText = null;
+    let centreUnchanged = false;
+
+    const steps = [
+      { label: UI_LABELS.centre, pick: (texts) => matchCentreOption(texts, target.vacCode) },
+      { label: UI_LABELS.category, pick: (texts) => pickCategoryOption(texts, ctx.uiCategory) },
+      { label: UI_LABELS.subCategory, pick: (texts) => (texts.length ? 0 : -1) }
+    ];
+
+    try {
+      for (const step of steps) {
+        await sleep(UI_STEP_GAP_MS);
+
+        if (!isApplicationDetailPage() || !getAuthToken()) {
+          return finishUiTarget(target, ctx, label, categoryText, {
+            status: 'error',
+            errorMessage: 'page or session changed mid-cycle',
+            abort: true
+          });
+        }
+
+        // Only a dropdown that exists and shows a different value counts; one
+        // that is briefly missing (Angular re-render) or empty is not the user.
+        const changed = expected.find((e) => {
+          const now = normalizeOptionText(selectedText(findSelectByLabel(e.label)));
+          return now && now !== normalizeOptionText(e.text);
+        });
+        if (changed) {
+          return finishUiTarget(target, ctx, label, categoryText, {
+            status: 'error',
+            errorMessage: `user interaction detected (${changed.label})`,
+            abort: true
+          });
+        }
+
+        const result = await uiSelect(step.label, step.pick);
+        if (!result.ok) {
+          return finishUiTarget(target, ctx, label, categoryText, {
+            status: 'error',
+            errorMessage: result.error
+          });
+        }
+
+        console.log(
+          `[VFS Extension] ${label}: ${step.label} -> ${result.skipped ? `skipped (single option: ${result.text})` : result.text}`
+        );
+
+        if (result.clickedAt) lastActionTs = result.clickedAt;
+        if (step.label === UI_LABELS.centre) centreUnchanged = Boolean(result.unchanged || result.skipped);
+        if (step.label === UI_LABELS.category) categoryText = result.text;
+        expected.push({ label: step.label, text: result.text });
+      }
+
+      if (centreUnchanged) {
+        console.warn(
+          `[VFS Extension] ${label}: centre was already selected; the page may not re-check it.`
+        );
+      }
+
+      const record = await waitForPageResponse(sinceTs, lastActionTs, target.vacCode);
+
+      if (!record) {
+        return finishUiTarget(target, ctx, label, categoryText, {
+          status: 'error',
+          errorMessage: centreUnchanged
+            ? 'no response from page (centre unchanged, nothing to re-check)'
+            : 'no response from page'
+        });
+      }
+
+      console.log(`[VFS Extension] ${label}: page response`, record);
+
+      if (record.status === 429) {
+        return finishUiTarget(target, ctx, label, categoryText, { status: 'rate_limited', httpStatus: 429 });
+      }
+
+      if (record.status < 200 || record.status >= 300) {
+        return finishUiTarget(target, ctx, label, categoryText, {
+          status: 'error',
+          errorMessage: `HTTP ${record.status}`,
+          httpStatus: record.status
+        });
+      }
+
+      if (record.earliestDate) {
+        return finishUiTarget(target, ctx, label, categoryText, {
+          status: 'slot',
+          earliestDate: record.earliestDate,
+          httpStatus: record.status
+        });
+      }
+
+      return finishUiTarget(target, ctx, label, categoryText, { status: 'none', httpStatus: record.status });
+
+    } catch (error) {
+      await closeSelectPanel().catch(() => {});
+      return finishUiTarget(target, ctx, label, categoryText, {
+        status: 'error',
+        errorMessage: error?.message || String(error)
+      });
+    }
+  }
+
+  async function runUiFlowCycle(rawTargets, ctx) {
+    const centreSelect = findSelectByLabel(UI_LABELS.centre);
+
+    if (!centreSelect) {
+      return [finishUiTarget({ vacCode: null }, ctx, 'centre', null, {
+        status: 'error',
+        errorMessage: `dropdown not found: ${UI_LABELS.centre}`
+      })];
+    }
+
+    const currentCode = vacCodeForCentreText(selectedText(centreSelect));
+
+    // Raw stored targets keep vacCode null for legacy CSVs -> the selected
+    // (or first) centre. The CSV category is not used on this flow, so
+    // AUH|LL and AUH|LLN collapse to one centre. See planUiTargets().
+    const targets = planUiTargets(rawTargets, currentCode);
+
+    console.log(
+      '[VFS Extension] UI flow targets:',
+      targets.map((t) => `${t.vacCode || 'first'}${t.extra ? ' (switch)' : ''}`).join(', '),
+      '| currently selected:',
+      currentCode || 'unknown'
+    );
+
+    const results = [];
+
+    for (const [i, target] of targets.entries()) {
+      if (i > 0) await sleep(CENTRE_GAP_MS);
+
+      // A centre takes ~3 steps + the response wait. Don't start one that could
+      // run past the session limit; the next cycle's session check handles the
+      // logout.
+      if (getSessionAgeMs() + UI_TARGET_BUDGET_MS >= SESSION_MAX_AGE_MS) {
+        console.log(
+          '[VFS Extension] Session close to the 23m limit. Skipping remaining centres this cycle.'
+        );
+        break;
+      }
+
+      const result = await runUiFlowTarget(target, ctx);
+      results.push(result);
+      if (result.status === 'rate_limited' || result.abort) break;
+    }
+
+    return results;
+  }
+
   async function checkSlots() {
-        const creds = await getStoredAutofillCredentials();
 
     if (!isApplicationDetailPage()) {
       console.log(
@@ -507,10 +1176,7 @@
 
     try {
 
-      // Get latest JWT every time
-      const token = getAuthToken();
-
-      if (!token) {
+      if (!getAuthToken()) {
         console.log(
           '[VFS Extension] No JWT. Will retry later.'
         );
@@ -518,37 +1184,44 @@
         return;
       }
 
+      const creds = await getStoredAutofillCredentials();
+
       const {
         countryCode,
         missionCode
       } = getUrlParams();
 
-      const vacCode =
+      const legacyVacCode =
         `${missionCode}${countryCode}`.toUpperCase();
 
       const routeHeader =
         `${countryCode}/en/${missionCode}`;
 
-      console.log(
-        '[VFS Extension] Country:',
-        countryCode
-      );
+      const clientSource = { origin: 'hardcoded', value: 'sA0tYVdQTOvTbuf4WtZ2+4RP93P2UfkkQcrsID92/mq0fjQJfmNMwvJFH3wNUYuf+GXSN0DV0O34YxwygRQ2Z5YLOJnroLeqey8HGrhLMSeBUUMte3/aHM9+Yqhxb/wUXXa3nk4zkSG7P3Z2zZ/dqUItxz51t1iVijTdjJcZaQqJczA3NuSZHK3l5hlLJu2IvHoND+UcXVuJD5P+ZxaeTBVsRs56ryKQMgpegd1Pjb1tZRtmcPis7f/jCBn3T/8XsdZJPx9kNWNXysyydYjslQLvs8ahKtxPM2Ayo/Dbh/KT6+qG1zb7LjkteLi1+iC3oNeJ7Y2a+uHRtQsDGZ9NYQ==' }; // was getClientSource()
+
+      const targets = await getSlotTargets(legacyVacCode);
 
       console.log(
-        '[VFS Extension] Mission:',
+        '[VFS Extension] Country:',
+        countryCode,
+        'Mission:',
         missionCode
       );
 
       console.log(
-        '[VFS Extension] VAC:',
-        vacCode
+        '[VFS Extension] Targets:',
+        targets.map((t) => `${t.vacCode}/${t.visaCategoryCode}`).join(', ')
+      );
+
+      console.log(
+        `[VFS Extension] ClientSource: ${clientSource.origin} (${clientSource.value.slice(0, 12)}...)`
       );
 
       const sessionAgeMs = getSessionAgeMs();
 
       if (sessionAgeMs >= SESSION_MAX_AGE_MS) {
         console.warn(
-          `[VFS Extension] Session age ${Math.round(sessionAgeMs / 60000)}m >= 29m limit. Forcing re-login.`
+          `[VFS Extension] Session age ${Math.round(sessionAgeMs / 60000)}m >= 23m limit. Forcing re-login.`
         );
 
         setBackoffState(1, SESSION_TIMEOUT_COOLDOWN_MIN, 'session_timeout');
@@ -556,183 +1229,122 @@
         sendCheckLogEntry({
           countryCode,
           missionCode,
-          vacCode,
-          visaCategoryCode: 'EmployL',
+          vacCode: targets.map((t) => t.vacCode).join(','),
+          visaCategoryCode: targets.map((t) => t.visaCategoryCode).join(','),
+          clientSourceOrigin: clientSource.origin,
           result: 'session_timeout',
-          errorMessage: 'Session exceeded 29 minute limit'
+          errorMessage: 'Session exceeded 23 minute limit'
         });
 
         await sendPushAlert(
           '🔄 VFS Session Refresh',
-          `Session active for 29+ minutes. Logging out and waiting ${SESSION_TIMEOUT_COOLDOWN_MIN}m before re-login.`
+          `Session active for 23+ minutes. Logging out, waiting ${SESSION_TIMEOUT_COOLDOWN_MIN}m, then logging in as the next account.`
         );
 
         stopChecker();
+        await rotateToNextAccount();
         await triggerUiLogout();
         return;
       }
 
-      const payload = {
-        countryCode: countryCode,
-        missionCode: missionCode,
-        vacCode: vacCode,
-        visaCategoryCode: 'EmployL',
-        roleName: 'Individual',
+      const ctx = {
+        countryCode,
+        missionCode,
+        routeHeader,
         loginUser: creds.username,
-        payCode: ''
+        clientSource,
+        uiCategory: UI_FLOW_COUNTRIES.includes(countryCode) ? await getStoredUiCategory() : ''
       };
 
-      const response = await fetch(API_URL, {
-        method: 'POST',
+      // UAE: drive the page's dropdowns and read the page's own API response
+      // (our own call gets 401 there). Everything else: call the API directly.
+      const results = UI_FLOW_COUNTRIES.includes(countryCode)
+        ? await runUiFlowCycle(await getStoredSlotTargets(), ctx)
+        : await runApiCycle(targets, ctx);
 
-        headers: {
-          'Accept':
-            'application/json, text/plain, */*',
+      const found = [];
+      const errors = [];
+      let noSlotCount = 0;
+      let rateLimited = false;
 
-          'Accept-Language':
-            'en-GB,en-US;q=0.9,en;q=0.8',
+      results.forEach((result) => {
+        // The "(switch)" centre exists only to make the page re-check; its
+        // result goes to the Sheet but never alerts or counts. A 429 still counts.
+        if (result.extra && result.status !== 'rate_limited') return;
 
-          'Authorize': token,
-
-          'ClientSource':
-            'imMG/l4MmYDsEvVPyHan3Tsc8dbxyD66qU4ZBAHKdDpkczriHRLjkHzXgYB97EXeat02vIldwprT+J+KOiXkH6btSCRq92U2f91aTt/B5XSq2XBUxYbA5OuL8CG3bnyxGChchENtdnUGvQz8eF4mZJjBy84dgS78ETWrQZnCFY+TLVbCzZ635iwf2JGwZjE5gC2p6ejNFdTrRQZmfmVbms7mH5Z4cALUUuFS3XjYxzYJmFmz/i+3Bg+V8Jg0o7OGs0xcfpbQs/Cij2PtjSqrgE0JJxiEmNLJFwZvDYplnZSK0PcttKJMJX9NkCwyIcXHePVVcfMzF26y5bJTtyGtlQ==',
-
-          'Content-Type':
-            'application/json;charset=UTF-8',
-
-          'Route': routeHeader
-        },
-
-        body: JSON.stringify(payload)
+        if (result.status === 'rate_limited') {
+          // Remaining targets were skipped, but still alert on any slot found
+          // earlier in this cycle before logging out (handled below).
+          rateLimited = true;
+        } else if (result.status === 'slot') {
+          found.push(`${result.label}: ${result.earliestDate}`);
+        } else if (result.status === 'none') {
+          noSlotCount += 1;
+        } else {
+          errors.push(`${result.label}: ${result.errorMessage}`);
+        }
       });
 
-      console.log(
-        '[VFS Extension] API status:',
-        response.status
-      );
+      // One combined alert per cycle. alert() blocks, so it runs only after
+      // every target has been checked.
+      if (found.length) {
+        const summary = found.join('\n');
+        showToast(`🚨 VFS SLOT AVAILABLE\n${summary}`);
+        await sendPushAlert(
+          '🚨 VFS SLOT AVAILABLE',
+          summary
+        );
+        alert(`🚨 VFS SLOT AVAILABLE\n${summary}`);
+        // Important:
+        // Do NOT stop checking.
+        // It will continue on the next cycle.
+      } else if (noSlotCount && !rateLimited) {
+        showToast(`No slot available (checked ${noSlotCount} center(s))`, 'error');
+        await sendPushAlert(
+          'No slot available',
+          `Appointment check completed for ${noSlotCount} center(s).`
+        );
+      }
 
-      if (response.status === 429) {
-        console.warn('[VFS Extension] 429 Too Many Requests detected');
+      if (rateLimited) {
         const nextAttempt = (getBackoffState().attempt || 0) + 1;
         const backoffMinutes = nextAttempt * 10;
         setBackoffState(nextAttempt, backoffMinutes, 'rate_limit');
 
-        sendCheckLogEntry({
-          countryCode,
-          missionCode,
-          vacCode,
-          visaCategoryCode: payload.visaCategoryCode,
-          result: 'rate_limited',
-          errorMessage: 'HTTP 429 Too Many Requests',
-          httpStatus: 429
-        });
-
         await sendPushAlert(
           '⚠️ VFS 429 Rate Limited',
-          `Too many requests. Logging out and waiting ${backoffMinutes}m before re-login.`
+          `Too many requests. Logging out and waiting ${backoffMinutes}m, then logging in as the next account.`
         );
 
         stopChecker();
+        await rotateToNextAccount();
         await triggerUiLogout();
         return;
       }
 
-      if (!response.ok) {
-        throw new Error(
-          `HTTP ${response.status}`
-        );
+      // A full cycle with at least one 2xx and no 429 -> reset any previous backoff.
+      if (found.length || noSlotCount) {
+        clearBackoffState();
       }
 
-      // Successful 2xx response -> reset any previous 429 backoff state
-      clearBackoffState();
-
-      const data = await response.json();
-
-      console.log(
-        '[VFS Extension] API response:',
-        data
-      );
-
-      if (data && data.earliestDate) {
-
-        console.log(
-          '[VFS Extension] 🚨 SLOT AVAILABLE:',
-          data.earliestDate
-        );
-        showToast(`🚨 VFS SLOT AVAILABLE\nEarliest Available Date: ${data.earliestDate}`);
+      if (errors.length) {
         await sendPushAlert(
-          '🚨 VFS SLOT AVAILABLE',
-          `Earliest Available Date: ${data.earliestDate}`
+          '⚠️ VFS check failed',
+          `${errors.join('; ')}. Will retry automatically.`
         );
-        alert(`🚨 VFS SLOT AVAILABLE\nEarliest Available Date: ${data.earliestDate}`);
-        // Important:
-        // Do NOT stop checking.
-        // It will continue every 3 minutes.
-
-        sendCheckLogEntry({
-          countryCode,
-          missionCode,
-          vacCode,
-          visaCategoryCode: payload.visaCategoryCode,
-          result: 'slot_available',
-          earliestDate: data.earliestDate,
-          httpStatus: response.status
-        });
-      } else {
-       // alert('No slot available');
-        showToast('No slot available', 'error');
-        await sendPushAlert(
-          'No slot available',
-          "Appointment check completed successfully."
-        );
-        console.log(
-          '[VFS Extension] No slot available'
-        );
-
-        sendCheckLogEntry({
-          countryCode,
-          missionCode,
-          vacCode,
-          visaCategoryCode: payload.visaCategoryCode,
-          result: 'no_slot',
-          httpStatus: response.status
-        });
       }
 
     } catch (error) {
 
       console.log(
-        '[VFS Extension] API error:',
+        '[VFS Extension] Check cycle error:',
         error
       );
-
-      // showToast(
-      //   `⚠️ VFS check failed: ${error?.message}. Retrying in 1 min.`,
-      //   'error'
-      // );
 
       await sendPushAlert(
         '⚠️ VFS check failed',
         `${error?.message}. Will retry automatically.`
       );
-
-      {
-        const fallback = getUrlParams();
-        const fallbackMission = fallback.missionCode;
-        const fallbackCountry = fallback.countryCode;
-
-        sendCheckLogEntry({
-          countryCode: fallbackCountry,
-          missionCode: fallbackMission,
-          vacCode: `${fallbackMission}${fallbackCountry}`.toUpperCase(),
-          visaCategoryCode: 'EmployL',
-          result: 'error',
-          errorMessage: error?.message,
-          httpStatus: error?.message?.startsWith('HTTP ')
-            ? Number(error.message.slice(5))
-            : null
-        });
-      }
 
     } finally {
 
@@ -971,7 +1583,7 @@
 
     const headline =
       reason === 'session_timeout'
-        ? '🔄 Session Timeout (29m limit)'
+        ? '🔄 Session Timeout (23m limit)'
         : '⏳ Rate Limited (HTTP 429)';
 
     banner.innerHTML = `${headline} &bull; Attempt #${attempt}<br><span style="font-size: 13px; font-weight: normal; opacity: 0.95;">Waiting cooldown before auto re-login: <strong>${formatted}</strong></span>`;
