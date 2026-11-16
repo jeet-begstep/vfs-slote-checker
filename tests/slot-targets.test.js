@@ -9,7 +9,9 @@ const {
   otherVacCode,
   planUiTargets,
   pickCategoryOption,
-  findCategoryColumn
+  findCategoryColumn,
+  parseCSV,
+  planSessionEnd
 } = require('../slot-targets.js');
 
 const codes = (targets) => targets.map((t) => `${t.vacCode}${t.extra ? '*' : ''}`);
@@ -173,4 +175,21 @@ test('findCategoryColumn reads the category column, blank when missing', () => {
   assert.equal(findCategoryColumn({ 'Appointment Category': 'X' }), 'X');
   assert.equal(findCategoryColumn({ 'vacCode|visaCategoryCode': 'AUH|LL' }), '');
   assert.equal(findCategoryColumn(null), '');
+});
+
+test('parseCSV: quoted commas, CRLF, blank lines, short rows', () => {
+  const rows = parseCSV('a,b,c\r\n1,"x,y",3\r\n\r\n4\r\n');
+  assert.deepEqual(rows, [{ a: '1', b: 'x,y', c: '3' }, { a: '4', b: '', c: '' }]);
+  assert.deepEqual(parseCSV(''), []);
+});
+
+test('planSessionEnd: normal mode sets cooldown and rotates itself', () => {
+  for (const reason of ['session_timeout', 'rate_limit']) {
+    assert.deepEqual(planSessionEnd(false, reason), { setBackoff: true, rotate: true, signal: null });
+  }
+});
+
+test('planSessionEnd: runner mode only signals the runner', () => {
+  assert.deepEqual(planSessionEnd(true, 'session_timeout'), { setBackoff: false, rotate: false, signal: 'session_timeout' });
+  assert.deepEqual(planSessionEnd(true, 'rate_limit'), { setBackoff: false, rotate: false, signal: 'rate_limit' });
 });

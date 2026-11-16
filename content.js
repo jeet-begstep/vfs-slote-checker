@@ -366,6 +366,31 @@
     return acc.username;
   }
 
+  // Runner mode (set by runner/index.js): the Node runner owns cooldown and
+  // account rotation, so on a session end we only tell it why. The event is
+  // written and the autofill credentials are removed BEFORE logging out: the
+  // logout navigates (the content script can be torn down), and without
+  // credentials the login watcher cannot sign straight back in.
+  async function isRunnerMode() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return false;
+    return new Promise((resolve) =>
+      chrome.storage.local.get(['vfsRunnerMode'], (r) => resolve(!!(r && r.vfsRunnerMode)))
+    );
+  }
+
+  async function signalRunner(type, removeCredentials = false) {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
+    await new Promise((resolve) =>
+      chrome.storage.local.set({ vfsRunnerEvent: { type, ts: Date.now() } }, resolve)
+    );
+    if (removeCredentials) {
+      await new Promise((resolve) =>
+        chrome.storage.local.remove([AUTOFILL_USERNAME_KEY, AUTOFILL_PASSWORD_KEY], resolve)
+      );
+    }
+    console.log('[VFS Extension] Runner signalled:', type);
+  }
+
   // [{vacCode, visaCategoryCode}] parsed from the CSV by the popup (slot-targets.js).
   const SLOT_TARGETS_KEY = 'vfsSlotTargets';
 
@@ -1224,7 +1249,10 @@
           `[VFS Extension] Session age ${Math.round(sessionAgeMs / 60000)}m >= 23m limit. Forcing re-login.`
         );
 
-        setBackoffState(1, SESSION_TIMEOUT_COOLDOWN_MIN, 'session_timeout');
+        const sessionEnd = planSessionEnd(await isRunnerMode(), 'session_timeout');
+        if (sessionEnd.setBackoff) {
+          setBackoffState(1, SESSION_TIMEOUT_COOLDOWN_MIN, 'session_timeout');
+        }
 
         sendCheckLogEntry({
           countryCode,
@@ -1242,7 +1270,8 @@
         );
 
         stopChecker();
-        await rotateToNextAccount();
+        if (sessionEnd.rotate) await rotateToNextAccount();
+        if (sessionEnd.signal) await signalRunner(sessionEnd.signal, true);
         await triggerUiLogout();
         return;
       }
@@ -1307,9 +1336,12 @@
       }
 
       if (rateLimited) {
+        const rateEnd = planSessionEnd(await isRunnerMode(), 'rate_limit');
         const nextAttempt = (getBackoffState().attempt || 0) + 1;
         const backoffMinutes = nextAttempt * 10;
-        setBackoffState(nextAttempt, backoffMinutes, 'rate_limit');
+        if (rateEnd.setBackoff) {
+          setBackoffState(nextAttempt, backoffMinutes, 'rate_limit');
+        }
 
         await sendPushAlert(
           '⚠️ VFS 429 Rate Limited',
@@ -1317,7 +1349,8 @@
         );
 
         stopChecker();
-        await rotateToNextAccount();
+        if (rateEnd.rotate) await rotateToNextAccount();
+        if (rateEnd.signal) await signalRunner(rateEnd.signal, true);
         await triggerUiLogout();
         return;
       }
@@ -1907,6 +1940,7 @@
     if (!isDashboardPage()) return;
     console.log('[VFS Agent] Initializing dashboard watcher for:', window.location.href);
     recordLoginTime();
+    isRunnerMode().then((on) => on && signalRunner('logged_in'));
     clickStartNewBookingWhenAvailable();
 
     const observer = new MutationObserver(() => {

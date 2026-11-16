@@ -10,7 +10,7 @@ A Manifest V3 Chrome extension for `visa.vfsglobal.com` (VFS Global visa appoint
 2. **Login/booking autofill** — watches the login and dashboard pages and auto-clicks/auto-fills through an Angular (Angular Material) SPA.
 3. **CSV-driven autofill from the popup** — the toolbar popup reads a CSV of credentials and pushes a row into the page via `chrome.tabs.sendMessage`.
 
-There is no build system, package manager, or test suite — this is plain unbundled JS loaded directly by Chrome. There are no npm scripts to run; "developing" means editing the files and reloading the unpacked extension at `chrome://extensions`.
+The extension itself is plain unbundled JS loaded directly by Chrome: "developing" it means editing the files and reloading the unpacked extension at `chrome://extensions`. The only `package.json` exists for the optional Playwright runner (`runner/`) and the unit tests (`npm test`); the extension has no build step.
 
 ## Running/testing changes
 
@@ -70,6 +70,13 @@ An optional `category` column (e.g. `Long Stay`) sets the appointment category o
 
 ### Multi-account rotation
 The popup stores every CSV row in `chrome.storage.local['vfsAccounts']` (`[{username, password, targets, category}]`) plus `vfsAccountIndex`. On a session timeout, `rotateToNextAccount()` advances the index (a→b→c→a…) and copies that account into `vfsAutofillUsername/Password`, `vfsSlotTargets`, `vfsUiCategory` *before* `triggerUiLogout()`; after the 5-min cooldown the login watcher autofills the new account. Assumes all rows share the same source/destination (login URL). Rotation happens on both triggers (session timeout and 429); the 429 backoff keeps its escalating `attempt * 10` min cooldown, now with the next account.
+
+### Playwright runner (`runner/`, optional)
+`npm run runner -- [--csv path] [--until HH:MM] [--clear-cookies]` launches the installed Google Chrome (headed, persistent profile `runner/.profile/`; Chrome 137+ ignores `--load-extension`, so run `npm run runner -- --setup` once and Load unpacked this folder in that profile; `findExtensionId()` reads its id from the profile preferences; `--chromium` uses Playwright's bundled Chromium, which still honours `--load-extension`) and cycles accounts from `runner/accounts.csv` (same columns as the popup CSV, plus `source`/`destination` per row). Per account: set `chrome.storage` (credentials, targets, category, `vfsRunnerMode: true`) via `runner-bridge.html`, open the login page, wait up to 10 min for the user to tick the captcha, let the extension check slots, then on the extension's end-of-session event confirm `/login` (30 s, else log `logout_unconfirmed`), close the tab, cool down, move to the next account. The runner, not the extension, owns cooldown and rotation in this mode.
+- **Runner mode contract** (`content.js`): with `vfsRunnerMode` set, a session end (23 min or 429) does *not* call `setBackoffState`/`rotateToNextAccount` (`planSessionEnd()` in `slot-targets.js`). It writes `vfsRunnerEvent: {type: 'session_timeout'|'rate_limit', ts}` and removes the stored autofill credentials *before* `triggerUiLogout()` (the logout navigates; no credentials means the login watcher can't sign straight back in). `initDashboardWatcher()` writes `{type: 'logged_in'}`. Without the flag nothing changes.
+- Timing (`runner/schedule.js`): cooldown 5 min after a session timeout, `n*10` min after the n-th consecutive 429 (one counter shared across accounts; a clean session resets it); the runner forces a logout at 27 min if the extension has not. Three captcha timeouts in a row stop the runner.
+- Cookies are kept between sessions (clearing them also drops the Cloudflare clearance); `--clear-cookies` clears them. `runner/runner.log` is JSON lines, never passwords. Ctrl+C clears the JWT and closes the browser; the server-side session is not explicitly ended.
+- Keep `runner/accounts.csv` and `runner/.profile/` out of git (they are in `.gitignore`).
 
 ### Page-state watchers (in `content.js`)
 - `initLoginWatcher()` / `initDashboardWatcher()` poll for specific buttons (sign-in, "start new booking") appearing in the DOM and auto-click/auto-fill them once enabled — needed because VFS renders these controls asynchronously and disables them until some client-side condition is met (`isButtonEnabled`).

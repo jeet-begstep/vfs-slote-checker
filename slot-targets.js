@@ -103,6 +103,52 @@ function planUiTargets(rawTargets, currentCode) {
   return targets;
 }
 
+// Minimal CSV parser shared by the popup and the runner: quoted cells may
+// contain commas; no escaped quotes. Returns one object per data row.
+function splitCSVLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const char = line[i];
+    if (char === '"') {
+      inQuotes = !inQuotes;
+    } else if (char === ',' && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += char;
+    }
+  }
+  result.push(current);
+  return result;
+}
+
+function parseCSV(text) {
+  const lines = String(text ?? '').split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return [];
+  const headers = splitCSVLine(lines[0]).map((h) => h.trim());
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const values = splitCSVLine(lines[i]);
+    const row = {};
+    headers.forEach((header, idx) => {
+      row[header] = (values[idx] ?? '').trim();
+    });
+    rows.push(row);
+  }
+  return rows;
+}
+
+// What content.js does when a session must end (23 min limit or HTTP 429).
+// Normal mode: set the in-tab cooldown and rotate to the next account itself.
+// Runner mode: the Node runner owns cooldown and rotation, so only signal it.
+function planSessionEnd(runnerMode, reason) {
+  return runnerMode
+    ? { setBackoff: false, rotate: false, signal: reason }
+    : { setBackoff: true, rotate: true, signal: null };
+}
+
 // Value of the optional "category" CSV column (the appointment category text
 // to pick on the UAE dropdown flow), or '' when absent/blank.
 function findCategoryColumn(row) {
@@ -129,6 +175,9 @@ if (typeof module !== 'undefined') {
     parseSlotTargets,
     findSlotTargetColumn,
     findCategoryColumn,
+    parseCSV,
+    splitCSVLine,
+    planSessionEnd,
     VAC_CENTRE_LABELS,
     matchCentreOption,
     vacCodeForCentreText,

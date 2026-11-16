@@ -1,0 +1,6 @@
+
+# runner
+node_modules/
+runner/.profile/
+runner/accounts.csv
+runner/runner.log

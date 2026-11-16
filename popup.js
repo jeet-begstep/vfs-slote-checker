@@ -209,44 +209,6 @@ autofillBtn.addEventListener('click', async () => {
   });
 });
 
-function parseCSV(text) {
-  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (lines.length === 0) return [];
-
-  const headers = splitCSVLine(lines[0]).map((h) => h.trim());
-  const rows = [];
-
-  for (let i = 1; i < lines.length; i++) {
-    const values = splitCSVLine(lines[i]);
-    const row = {};
-    headers.forEach((header, idx) => {
-      row[header] = (values[idx] ?? '').trim();
-    });
-    rows.push(row);
-  }
-  return rows;
-}
-
-function splitCSVLine(line) {
-  const result = [];
-  let current = '';
-  let inQuotes = false;
-
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i];
-    if (char === '"') {
-      inQuotes = !inQuotes;
-    } else if (char === ',' && !inQuotes) {
-      result.push(current);
-      current = '';
-    } else {
-      current += char;
-    }
-  }
-  result.push(current);
-  return result;
-}
-
 function renderPreview(rows) {
   if (rows.length === 0) {
     previewRoot.innerHTML = '<div class="empty">No rows found.</div>';
