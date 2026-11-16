@@ -50,8 +50,9 @@ fileInput.addEventListener('change', (event) => {
 
       const baseVfsUrl = `https://visa.vfsglobal.com/${sourceCountry || 'default'}/en/${destinationCountry || 'default'}`;
       console.log('[VFS Extension] Redirecting active tab to base VFS URL:', baseVfsUrl);
-      const { targets, invalid } = saveRowConfig(rowToSend);
-      setStatus(`Loaded ${rows.length} row(s). ${describeTargets(targets, invalid)}`, invalid.length ? 'error' : 'success');
+      const accountCount = saveAllAccounts(rows);
+      const { targets, invalid } = saveRowConfig(rowToSend, 0);
+      setStatus(`Loaded ${rows.length} row(s), ${accountCount} account(s) for rotation. ${describeTargets(targets, invalid)}`, invalid.length ? 'error' : 'success');
       await redirectToVfsLogin(sourceCountry, destinationCountry);
     } catch (err) {
       setStatus(`Error parsing file: ${err.message}`, 'error');
@@ -67,10 +68,30 @@ fileInput.addEventListener('change', (event) => {
 
 const MAX_RECOMMENDED_TARGETS = 4;
 
+// Stores every CSV row as an account so content.js can rotate a -> b -> c -> a
+// after each session timeout. Rows without credentials are skipped.
+function saveAllAccounts(rows) {
+  const accounts = rows
+    .map((row) => ({
+      username: row.email || row.user || row.username || '',
+      password: row.password || row.pass || '',
+      targets: parseSlotTargets(findSlotTargetColumn(row)).targets,
+      category: findCategoryColumn(row)
+    }))
+    .filter((a) => a.username && a.password);
+  try {
+    chrome.storage.local.set({ vfsAccounts: accounts });
+  } catch (e) {
+    console.error('[VFS Extension] Failed to save accounts to storage:', e);
+  }
+  console.log('[VFS Extension] Saved accounts:', accounts.map((a) => a.username));
+  return accounts.length;
+}
+
 // Saves credentials and slot-check targets for content.js. Always overwrites
 // vfsSlotTargets so centers from a previous upload are never checked by mistake;
 // an empty list makes content.js fall back to its legacy single check.
-function saveRowConfig(row) {
+function saveRowConfig(row, accountIndex = 0) {
   const usernameValue = row.email || row.user || row.username || '';
   const passwordValue = row.password || row.pass || '';
   const { targets, invalid } = parseSlotTargets(findSlotTargetColumn(row));
@@ -80,7 +101,8 @@ function saveRowConfig(row) {
       vfsAutofillUsername: usernameValue,
       vfsAutofillPassword: passwordValue,
       vfsSlotTargets: targets,
-      vfsUiCategory: findCategoryColumn(row)
+      vfsUiCategory: findCategoryColumn(row),
+      vfsAccountIndex: accountIndex
     });
   } catch (e) {
     console.error('[VFS Extension] Failed to save row config to storage:', e);
@@ -166,7 +188,8 @@ autofillBtn.addEventListener('click', async () => {
 
   const usernameValue = row.email || row.user || row.username || '';
   const passwordValue = row.password || row.pass || '';
-  const { targets, invalid } = saveRowConfig(row);
+  saveAllAccounts(loadedRows);
+  const { targets, invalid } = saveRowConfig(row, idx);
   const targetsSummary = describeTargets(targets, invalid);
   const targetsTone = invalid.length ? 'error' : 'success';
 

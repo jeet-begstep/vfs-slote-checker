@@ -72,12 +72,12 @@
   const BACKOFF_STORAGE_KEY_REASON = 'VFS_429_REASON';
 
   // -------------------------------------------------------
-  // SESSION AGE TRACKING (force re-login every 29 minutes)
+  // SESSION AGE TRACKING (force re-login every 23 minutes)
   // -------------------------------------------------------
 
   const LOGIN_TIME_STORAGE_KEY = 'VFS_LAST_LOGIN_TS';
-  const SESSION_MAX_AGE_MS = 27 * 60 * 1000; // 29 minutes
-  const SESSION_TIMEOUT_COOLDOWN_MIN = 10; // minutes
+  const SESSION_MAX_AGE_MS = 23 * 60 * 1000; // 23 minutes
+  const SESSION_TIMEOUT_COOLDOWN_MIN = 5; // minutes
 
   function recordLoginTime() {
     try {
@@ -335,6 +335,35 @@
   function clearStoredAutofillCredentials() {
     if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return;
     chrome.storage.local.remove([AUTOFILL_USERNAME_KEY, AUTOFILL_PASSWORD_KEY]);
+  }
+
+  // Account rotation: popup stores every CSV row in vfsAccounts; on each session
+  // timeout we advance vfsAccountIndex (a -> b -> c -> a ...) and copy that
+  // account's credentials/targets/category into the keys the login + checker read.
+  async function rotateToNextAccount() {
+    if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.local) return null;
+    const data = await new Promise((resolve) =>
+      chrome.storage.local.get(['vfsAccounts', 'vfsAccountIndex'], resolve)
+    );
+    const accounts = Array.isArray(data && data.vfsAccounts) ? data.vfsAccounts : [];
+    if (!accounts.length) return null;
+    const current = Number(data.vfsAccountIndex) || 0;
+    const next = (current + 1) % accounts.length;
+    const acc = accounts[next];
+    await new Promise((resolve) =>
+      chrome.storage.local.set(
+        {
+          vfsAccountIndex: next,
+          vfsAutofillUsername: acc.username,
+          vfsAutofillPassword: acc.password,
+          vfsSlotTargets: acc.targets || [],
+          vfsUiCategory: acc.category || ''
+        },
+        resolve
+      )
+    );
+    console.log(`[VFS Extension] Rotated account ${current} -> ${next} (${acc.username})`);
+    return acc.username;
   }
 
   // [{vacCode, visaCategoryCode}] parsed from the CSV by the popup (slot-targets.js).
@@ -1101,7 +1130,7 @@
       // logout.
       if (getSessionAgeMs() + UI_TARGET_BUDGET_MS >= SESSION_MAX_AGE_MS) {
         console.log(
-          '[VFS Extension] Session close to the 29m limit. Skipping remaining centres this cycle.'
+          '[VFS Extension] Session close to the 23m limit. Skipping remaining centres this cycle.'
         );
         break;
       }
@@ -1192,7 +1221,7 @@
 
       if (sessionAgeMs >= SESSION_MAX_AGE_MS) {
         console.warn(
-          `[VFS Extension] Session age ${Math.round(sessionAgeMs / 60000)}m >= 29m limit. Forcing re-login.`
+          `[VFS Extension] Session age ${Math.round(sessionAgeMs / 60000)}m >= 23m limit. Forcing re-login.`
         );
 
         setBackoffState(1, SESSION_TIMEOUT_COOLDOWN_MIN, 'session_timeout');
@@ -1204,15 +1233,16 @@
           visaCategoryCode: targets.map((t) => t.visaCategoryCode).join(','),
           clientSourceOrigin: clientSource.origin,
           result: 'session_timeout',
-          errorMessage: 'Session exceeded 29 minute limit'
+          errorMessage: 'Session exceeded 23 minute limit'
         });
 
         await sendPushAlert(
           '🔄 VFS Session Refresh',
-          `Session active for 29+ minutes. Logging out and waiting ${SESSION_TIMEOUT_COOLDOWN_MIN}m before re-login.`
+          `Session active for 23+ minutes. Logging out, waiting ${SESSION_TIMEOUT_COOLDOWN_MIN}m, then logging in as the next account.`
         );
 
         stopChecker();
+        await rotateToNextAccount();
         await triggerUiLogout();
         return;
       }
@@ -1283,10 +1313,11 @@
 
         await sendPushAlert(
           '⚠️ VFS 429 Rate Limited',
-          `Too many requests. Logging out and waiting ${backoffMinutes}m before re-login.`
+          `Too many requests. Logging out and waiting ${backoffMinutes}m, then logging in as the next account.`
         );
 
         stopChecker();
+        await rotateToNextAccount();
         await triggerUiLogout();
         return;
       }
@@ -1552,7 +1583,7 @@
 
     const headline =
       reason === 'session_timeout'
-        ? '🔄 Session Timeout (29m limit)'
+        ? '🔄 Session Timeout (23m limit)'
         : '⏳ Rate Limited (HTTP 429)';
 
     banner.innerHTML = `${headline} &bull; Attempt #${attempt}<br><span style="font-size: 13px; font-weight: normal; opacity: 0.95;">Waiting cooldown before auto re-login: <strong>${formatted}</strong></span>`;
